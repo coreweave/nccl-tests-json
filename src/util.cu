@@ -21,8 +21,15 @@
 #include <errno.h>
 #include <string>
 #include <iomanip>
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+#include <nvml.h>
+#include <random>
 
 #define PRINT if (is_main_thread) printf
+
+#define MAX_LINE 2048
 
 extern int nThreads;
 extern int nGpus;
@@ -44,7 +51,7 @@ static thread_local bool write_json;
 
 #define JSON_FILE_VERSION 1
 
-#define TIME_STRING_FORMAT "%Y-%m-%d %H:%M:%S"
+#define TIME_STRING_FORMAT "%Y-%m-%d %H:%M:%SZ"
 
 typedef enum {
   JSON_NONE, // A pseudo-state meaning that the document is empty
@@ -81,7 +88,8 @@ static bool sanitizeJson(char out[], int lim, const char *in) {
     case '/':
     case '\t':
     case '\n':
-      if(c + 2 > lim) {
+      // Two escaped bytes plus the terminating NUL must fit.
+      if(c + 2 >= lim) {
         out[c] = 0;
         return false;
       }
@@ -162,7 +170,9 @@ static void jsonKey(const char *name) {
     break;
   }
   char tmp[2048];
-  sanitizeJson(tmp, sizeof(tmp), name);
+  if(!sanitizeJson(tmp, sizeof(tmp), name)) {
+    fprintf(stderr, "JSON key was truncated at %zu bytes or contained unsupported characters.\n", sizeof(tmp)-1);
+  }
   fprintf(json_report_fp, "\"%s\":", tmp);
   jsonPushState(JSON_KEY);
 }
@@ -232,6 +242,24 @@ static void jsonNull() {
   fprintf(json_report_fp, "null");
 }
 
+static void jsonFinishCurrent() {
+  switch(jsonCurrState()) {
+  case JSON_KEY:
+    jsonNull();
+    break;
+  case JSON_OBJECT_EMPTY:
+  case JSON_OBJECT_SOME:
+    jsonFinishObject();
+    break;
+  case JSON_LIST_EMPTY:
+  case JSON_LIST_SOME:
+    jsonFinishList();
+    break;
+  default:
+    assert(0);
+  }
+}
+
 // Write a (sanititzed) string
 static void jsonStr(const char *str) {
   if(str == nullptr) {
@@ -240,7 +268,9 @@ static void jsonStr(const char *str) {
   }
   jsonValHelper();
   char tmp[2048];
-  sanitizeJson(tmp, sizeof(tmp), str);
+  if(!sanitizeJson(tmp, sizeof(tmp), str)) {
+    fprintf(stderr, "JSON string was truncated at %zu bytes or contained unsupported characters.\n", sizeof(tmp)-1);
+  }
   fprintf(json_report_fp, "\"%s\"", tmp);
 }
 
@@ -267,6 +297,10 @@ static void jsonDouble(const double val) {
   if(val != val) {
     fprintf(json_report_fp, "\"nan\"");
   }
+  else if(isinf(val)) {
+    // JSON has no infinity literal; emit a string, matching the "nan" handling above.
+    fprintf(json_report_fp, val < 0 ? "\"-inf\"" : "\"inf\"");
+  }
   else {
     fprintf(json_report_fp, "%lf", val);
   }
@@ -277,7 +311,7 @@ static void jsonDouble(const double val) {
 void formatNow(char *buff, int len) {
   time_t now;
   time(&now);
-  struct tm *timeinfo = localtime(&now);
+  struct tm *timeinfo = gmtime(&now);
 
   strftime(buff, len, TIME_STRING_FORMAT, timeinfo);
 }
@@ -362,12 +396,17 @@ void jsonIdentifyWriter(bool is_writer) {
 void jsonOutputFinalize() {
   if(write_json) {
 
-    jsonKey("end_time");
-    char timebuffer[128];
-    formatNow(timebuffer, sizeof(timebuffer));
-    jsonStr(timebuffer);
+    if(state_n == 1 &&
+       (jsonCurrState() == JSON_OBJECT_EMPTY || jsonCurrState() == JSON_OBJECT_SOME)) {
+      jsonKey("end_time");
+      char timebuffer[128];
+      formatNow(timebuffer, sizeof(timebuffer));
+      jsonStr(timebuffer);
+    }
 
-    jsonFinishObject();
+    while(state_n > 0) {
+      jsonFinishCurrent();
+    }
 
     assert(jsonCurrState() == JSON_NONE);
     free(states);
@@ -388,14 +427,23 @@ struct rankInfo_t {
   int device;
   char device_hex[128];
   char devinfo[1024];
+  char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
 };
 
-// Helper function to parse the device info lines passed via MPI to the root rank.
-// This fills 'rank' with the parsed contents of 'instring'.
+// Helper function to parse one device-info line (as gathered to the root rank).
+// This fills 'rank' with the parsed contents at the start of 'instring' and
+// returns the number of bytes consumed, so the caller can advance to the next
+// line and parse again — a single process may report several GPUs, hence
+// several lines, in one buffer. Returns 0 when no complete record is present
+// (end of buffer / trailing garbage), which lets callers loop until exhausted.
+// The sscanf format below hardcodes the gpuSerial field width (%29); this guards
+// against NVML_DEVICE_SERIAL_BUFFER_SIZE drifting out from under that magic number.
+static_assert(sizeof(rankInfo_t::gpuSerial) == 30,
+              "parseRankInfo assumes that rankInfo_t::gpuSerial has a width of 30 bytes.");
 static int parseRankInfo(rankInfo_t *rank, const char *instring) {
-  int end;
-  sscanf(instring,
-         "#  Rank %d Group %d Pid %d on %1024s device %d [%128[^]]] %1024[^\n]\n%n",
+  int end = 0;
+  const int matched = sscanf(instring,
+         "#  Rank %d Group %d Pid %d on %1023s device %d [%127[^]]] %1023[^#]#%29[^\n]\n%n",
          &rank->rank,
          &rank->group,
          &rank->pid,
@@ -403,8 +451,13 @@ static int parseRankInfo(rankInfo_t *rank, const char *instring) {
          &rank->device,
          rank->device_hex,
          rank->devinfo,
+         rank->gpuSerial,
          &end);
-  return end;
+  // All 8 fields must be present for a complete record; %n (end) is only
+  // assigned once the scan reaches the trailing newline, i.e. a whole line was
+  // consumed. Anything short of that (end of buffer, "...\n" truncation marker)
+  // yields 0 so the caller's loop terminates.
+  return (matched == 8) ? end : 0;
 }
 
 static void jsonRankInfo(const rankInfo_t *ri) {
@@ -416,8 +469,71 @@ static void jsonRankInfo(const rankInfo_t *ri) {
   jsonKey("device");      jsonInt(ri->device);
   jsonKey("device_hex");  jsonStr(ri->device_hex);
   jsonKey("device_info"); jsonStr(ri->devinfo);
+  jsonKey("serial");      jsonStr(ri->gpuSerial);
   jsonFinishObject();
 }
+
+
+// Fetch the serial number for one GPU into `serial` (must hold at least
+// NVML_DEVICE_SERIAL_BUFFER_SIZE bytes). NVML must already be initialized by the
+// caller. Returns 0 on success, nonzero if the handle or serial
+// lookup fails (in which case `serial` is left untouched for the caller to handle).
+int getGPUSerial(const char *pciBusId, char *serial) {
+    nvmlDevice_t device;
+
+    // Look up by PCI bus id, not NVML index: NVML's index space is PCI-ordered and
+    // ignores CUDA_VISIBLE_DEVICES, whereas the caller's cudaDev is a CUDA runtime
+    // ordinal that CUDA_VISIBLE_DEVICES / containers / schedulers remap. Keying by
+    // the stable bus id guarantees the serial matches the GPU this rank actually uses.
+    nvmlReturn_t result = nvmlDeviceGetHandleByPciBusId(pciBusId, &device);
+    if (NVML_SUCCESS != result) {
+        fprintf(stderr, "Failed to get device handle for PCI %s: %s\n", pciBusId, nvmlErrorString(result));
+        return 1;
+    }
+
+    result = nvmlDeviceGetSerial(device, serial, NVML_DEVICE_SERIAL_BUFFER_SIZE);
+    if (NVML_SUCCESS != result) {
+        fprintf(stderr, "Failed to get serial number for PCI %s: %s\n", pciBusId, nvmlErrorString(result));
+        return 1;
+    }
+
+    return 0;
+}
+
+// Generate an RFC-4122 v4 UUID string (36 chars + NUL) without an external libuuid,
+// so building needs no uuid-dev. Randomness is fine for a per-run identifier.
+static void genUuidV4(char out[37]) {
+    std::random_device rd;
+    unsigned char b[16];
+    for (int i = 0; i < 16; i += 4) {
+        unsigned int r = rd();
+        b[i+0] =  r        & 0xFF;
+        b[i+1] = (r >> 8)  & 0xFF;
+        b[i+2] = (r >> 16) & 0xFF;
+        b[i+3] = (r >> 24) & 0xFF;
+    }
+    b[6] = (b[6] & 0x0F) | 0x40;  // version 4
+    b[8] = (b[8] & 0x3F) | 0x80;  // variant 10x
+    snprintf(out, 37,
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+}
+
+// RAII owner for the NVML library handle. Initializes NVML on construction and
+// guarantees a single shutdown when the scope exits, on any path (normal return,
+// early error return, exception). `ready` reflects whether init succeeded; a
+// failed init means serials are unavailable but the rest of the report proceeds.
+struct NvmlSession {
+  const bool ready;
+  NvmlSession() : ready(nvmlInit() == NVML_SUCCESS) {}
+  ~NvmlSession() {
+    if (ready && nvmlShutdown() != NVML_SUCCESS) {
+      fprintf(stderr, "Failed to shut down NVML.\n");
+    }
+  }
+  NvmlSession(const NvmlSession&) = delete;
+  NvmlSession& operator=(const NvmlSession&) = delete;
+};
 
 // Write the start of a benchmark output line containing the bytes &
 // op type, both to stdout and to json if we are writing there.
@@ -455,6 +571,12 @@ void writeBenchMarkLineNullBody() {
 }
 
 void getFloatStr(double value, int width, char* str) {
+  if (isinf(value)) {
+    // +inf would loop forever below (value >= val always true as val wraps);
+    // short-circuit both signs.
+    sprintf(str, "%*s", width, value < 0 ? "-inf" : "inf");
+    return;
+  }
   int power = 0;
   for (uint64_t val = 1; value >= val; val *= 10) power++;
 
@@ -543,18 +665,26 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     jsonKey("aggregated_iterations"); jsonInt(agg_iters);
     jsonKey("validation");            jsonInt(datacheck);
     jsonKey("graph");                 jsonInt(cudaGraphLaunches);
-    jsonKey("blocking_collectives");  jsonBool(blocking_coll);
+    jsonKey("blocking_collectives");  jsonInt(blocking_coll);
     jsonKey("parallel_init");         jsonBool(parallel_init);
   }
 
   PRINT("# Using devices\n");
-#define MAX_LINE 2048
   char line[MAX_LINE];
   int len = 0;
   const char* envstr = getenv("NCCL_TESTS_DEVICE");
   const int gpu0 = envstr ? atoi(envstr) : -1;
   int available_devices;
+  char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
   CUDACHECK(cudaGetDeviceCount(&available_devices));
+
+  // Initialize NVML once for the whole device loop; the guard shuts it down on
+  // every exit path from here on (see NvmlSession).
+  NvmlSession nvml;
+  if (!nvml.ready) {
+    fprintf(stderr, "Failed to initialize NVML; GPU serials will be reported as \"unknown\".\n");
+  }
+
   for (int i=0; i<nThreads*nGpus; i++) {
     const int cudaDev = (gpu0 != -1 ? gpu0 : localRank*nThreads*nGpus) + i;
     const int rank = proc*nThreads*nGpus+i;
@@ -566,12 +696,26 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       return testNotImplemented;
     }
     CUDACHECK(cudaGetDeviceProperties(&prop, cudaDev));
+    // Resolve the serial by stable PCI bus id (see getGPUSerial): cudaDev is a CUDA
+    // ordinal that CUDA_VISIBLE_DEVICES can remap, so an NVML-by-index lookup could
+    // return another GPU's serial. cudaDeviceGetPCIBusId yields the "dddd:bb:dd.f"
+    // string NVML expects.
+    char pciBusId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE] = {0};
+    if (!nvml.ready
+        || cudaDeviceGetPCIBusId(pciBusId, sizeof(pciBusId), cudaDev) != cudaSuccess
+        || getGPUSerial(pciBusId, gpuSerial) != 0) {
+      // NVML unavailable or this device's lookup failed — write a defined value
+      // rather than emit uninitialized/stale bytes into the report (and JSON serial).
+      snprintf(gpuSerial, sizeof(gpuSerial), "unknown");
+    }
     if (len < MAX_LINE) {
-      len += snprintf(line+len, MAX_LINE-len, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%02x:%02x] %s\n",
-                      rank, color, getpid(), hostname, cudaDev, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name);
+      len += snprintf(line+len, MAX_LINE-len, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%02x:%02x] %s#%s\n",
+                      rank, color, getpid(), hostname, cudaDev, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name, gpuSerial);
     }
     *maxMem = std::min(*maxMem, prop.totalGlobalMem);
   }
+  // NVML is shut down by the NvmlSession guard when this function returns.
+
   if (len >= MAX_LINE) {
     strcpy(line+MAX_LINE-5, "...\n");
   }
@@ -588,9 +732,18 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     for (int p = 0; p < totalProcs; p++) {
       PRINT("%s", lines+MAX_LINE*p);
       if(write_json) {
+        // A process that drives multiple GPUs contributes multiple "# Rank"
+        // lines in its MAX_LINE buffer; walk them all so every GPU's serial is
+        // emitted, not just the first. parseRankInfo returns the bytes consumed
+        // (0 at end-of-buffer); the buffer is NUL-terminated within MAX_LINE, so
+        // the walk cannot run past rank p into rank p+1.
+        const char *cursor = lines + MAX_LINE*p;
         rankInfo_t rankinfo;
-        parseRankInfo(&rankinfo, lines + MAX_LINE*p);
-        jsonRankInfo(&rankinfo);
+        int consumed;
+        while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
+          jsonRankInfo(&rankinfo);
+          cursor += consumed;
+        }
       }
     }
     if(write_json) {
@@ -602,11 +755,18 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
 #else
   PRINT("%s", line);
   if(write_json) {
-    rankInfo_t rankinfo;
-    parseRankInfo(&rankinfo, line);
     jsonKey("devices");
     jsonStartList();
-    jsonRankInfo(&rankinfo);
+    // This process may own several GPUs (nThreads*nGpus > 1), so it wrote one
+    // "# Rank" line per GPU into 'line'. Walk every line so each GPU's serial is
+    // emitted, instead of parsing only the first.
+    const char *cursor = line;
+    rankInfo_t rankinfo;
+    int consumed;
+    while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
+      jsonRankInfo(&rankinfo);
+      cursor += consumed;
+    }
     jsonFinishList();
   }
 #endif
@@ -651,6 +811,8 @@ void writeResultFooter(const int errors[], const double bw[], double check_avg_b
   PRINT("# Collective test concluded: %s\n", program_name);
 
   if(write_json) {
+    char uuid[37];
+    genUuidV4(uuid);
     jsonKey("out_of_bounds");
     jsonStartObject();
     jsonKey("count");      jsonInt(errors[0]);
@@ -661,6 +823,8 @@ void writeResultFooter(const int errors[], const double bw[], double check_avg_b
     jsonKey("bandwidth"); jsonDouble(bw[0]);
     jsonKey("okay");       check_avg_bw == -1 ? jsonStr("unchecked") : jsonBool(bw[0] >= check_avg_bw*(0.9));
     jsonFinishObject();
+    jsonKey("collective"); jsonStr(program_name);
+    jsonKey("uuid");       jsonStr(uuid);
   }
 }
 
