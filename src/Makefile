@@ -28,6 +28,11 @@ ifeq ($(MPI_IBM),1)
 NVCUFLAGS += -DMPI_SUPPORT
 NVLDFLAGS += -lmpi_ibm
 endif
+# Optional build-time extension, described in ext_hooks.h.
+ifneq ($(EXT_DIR),)
+NVCUFLAGS += -DNCCL_TESTS_EXTENSION -I$(EXT_DIR)/include
+NVLDFLAGS += $(EXT_DIR)/build/libnccltestsext.a
+endif
 LIBRARIES += nccl
 NVLDFLAGS += $(LIBRARIES:%=-l%) -ldl
 

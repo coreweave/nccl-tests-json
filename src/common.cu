@@ -792,6 +792,7 @@ testResult_t threadInit(struct threadArgs* args) {
   is_main_thread = (is_main_proc && args->thread == 0) ? 1 : 0;
 
   jsonIdentifyWriter(is_main_thread);
+  NCCL_TESTS_EXT(nccl_tests_ext_identify_writer(1));  // guarded, so only the writer thread gets here
 
   // Capture GPU memory before initializing the NCCL communicators
   int64_t* initFreeGpuMem = (int64_t*)calloc(args->nGpus*3, sizeof(int64_t));
@@ -1205,6 +1206,7 @@ int main(int argc, char* argv[], char **envp) {
 
   const output_file_type_t output_file_type = classifyOutputFile(output_file);
   outputFileInit(output_file_type, output_file, argc, argv, envp);
+  NCCL_TESTS_EXT_ALWAYS(nccl_tests_ext_init(argc, argv, envp));
 
   if(output_file) {
     free(output_file);
@@ -1214,6 +1216,7 @@ int main(int argc, char* argv[], char **envp) {
   testResult_t result = run();
 
   outputFileFinalize(output_file_type);
+  NCCL_TESTS_EXT(nccl_tests_ext_finalize((int)result));
 
   TESTCHECK(result);
 
@@ -1291,6 +1294,7 @@ testResult_t run() {
   is_main_thread = is_main_proc = (proc == 0) ? 1 : 0;
 
   jsonIdentifyWriter(is_main_thread);
+  NCCL_TESTS_EXT(nccl_tests_ext_identify_writer(1));  // guarded, so only the writer thread gets here
 
   size_t maxMem = ~0;
   testResult_t report_result = writeDeviceReport(&maxMem, localRank, proc, totalProcs, color, hostname, program_invocation_short_name);

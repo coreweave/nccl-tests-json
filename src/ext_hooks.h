@@ -1,0 +1,28 @@
+/*************************************************************************
+ * Build-time extension hooks.
+ *
+ * These macros let an extension linked in at build time observe a run. The
+ * extension receives the run configuration, the result for each message
+ * size, every device, the closing summary and any errors. Setting EXT_DIR in
+ * the Makefile defines NCCL_TESTS_EXTENSION, which includes
+ * <nccl_tests_ext.h> from EXT_DIR/include and enables the hooks. When
+ * EXT_DIR is unset, the hooks compile to nothing and the tests behave
+ * exactly as they would without them.
+ ************************************************************************/
+#ifndef __EXT_HOOKS_H__
+#define __EXT_HOOKS_H__
+
+#ifdef NCCL_TESTS_EXTENSION
+#include <nccl_tests_ext.h>
+#define NCCL_TESTS_EXT_ENABLED 1
+// Only the main thread of the reporting process reports. run() sets is_main_thread.
+#define NCCL_TESTS_EXT(call)        do { if (is_main_thread) { call; } } while (0)
+// For hooks that run before is_main_thread is known, such as process init and writer identification.
+#define NCCL_TESTS_EXT_ALWAYS(call) do { call; } while (0)
+#else
+#define NCCL_TESTS_EXT_ENABLED 0
+#define NCCL_TESTS_EXT(call)        do { } while (0)
+#define NCCL_TESTS_EXT_ALWAYS(call) do { } while (0)
+#endif
+
+#endif

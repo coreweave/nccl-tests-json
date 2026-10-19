@@ -730,6 +730,7 @@ void writeBenchmarkLinePreamble(size_t nBytes, size_t nElem, const char typeName
   char rootName[100];
   sprintf(rootName, "%6i", root);
   PRINT("%12li  %12li  %8s  %6s  %6s", nBytes, nElem, typeName, opName, rootName);
+  NCCL_TESTS_EXT(nccl_tests_ext_size_begin(nBytes, nElem, typeName, opName, root));
 
   if(write_json) {
     jsonStartObject();
@@ -804,6 +805,8 @@ void writeBenchmarkLineBody(double timeUsec, double algBw, double busBw, bool re
     PRINT("%21s", timebuffer);
   }
 
+  NCCL_TESTS_EXT(nccl_tests_ext_size_result(out_of_place, timeUsec, algBw, busBw, reportErrors, (long long)wrongElts));
+
   if(write_json) {
     jsonKey(out_of_place ? "out_of_place" : "in_place");
     jsonStartObject();
@@ -836,6 +839,11 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   if (blocking_coll > 1)  PRINT("# Blocking Enabled: wait for completion after each collective (no barrier) \n");
   if (parallel_init) PRINT("# Parallel Init Enabled: threads call into NcclInitRank concurrently \n");
   PRINT("#\n");
+
+  NCCL_TESTS_EXT(nccl_tests_ext_run_config(program_name, NCCL_TESTS_VERSION, NCCL_VERSION_CODE, test_ncclVersion,
+                                           CUDART_VERSION, nThreads, nGpus, minBytes, maxBytes, stepBytes, stepFactor,
+                                           warmup_iters, iters, agg_iters, datacheck, cudaGraphLaunches, blocking_coll,
+                                           parallel_init));
 
   if(write_json) {
     jsonKey("config");
@@ -913,14 +921,17 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     }
     for (int p = 0; p < totalProcs; p++) {
       PRINT("%s", lines+MAX_LINE*p);
-      if(write_json) {
+      if(write_json || NCCL_TESTS_EXT_ENABLED) {
         // Each process's buffer is NUL-terminated within its MAX_LINE slot, so
-        // the walk stops before reaching the next process's slot.
+        // the walk stops before reaching the next process's slot. A built-in
+        // extension, if present, sees every record too.
         const char *cursor = lines + MAX_LINE*p;
         rankInfo_t rankinfo;
         int consumed;
         while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
-          jsonRankInfo(&rankinfo);
+          if(write_json) jsonRankInfo(&rankinfo);
+          NCCL_TESTS_EXT(nccl_tests_ext_device(rankinfo.rank, rankinfo.group, rankinfo.pid, rankinfo.hostname,
+                                                 rankinfo.device, rankinfo.device_hex, rankinfo.devinfo, rankinfo.gpuSerial));
           cursor += consumed;
         }
       }
@@ -936,13 +947,20 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   if(write_json) {
     jsonKey("devices");
     jsonStartList();
+  }
+  if(write_json || NCCL_TESTS_EXT_ENABLED) {
+    // A built-in extension, if present, sees every record too.
     const char *cursor = line;
     rankInfo_t rankinfo;
     int consumed;
     while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
-      jsonRankInfo(&rankinfo);
+      if(write_json) jsonRankInfo(&rankinfo);
+      NCCL_TESTS_EXT(nccl_tests_ext_device(rankinfo.rank, rankinfo.group, rankinfo.pid, rankinfo.hostname,
+                                             rankinfo.device, rankinfo.device_hex, rankinfo.devinfo, rankinfo.gpuSerial));
       cursor += consumed;
     }
+  }
+  if(write_json) {
     jsonFinishList();
   }
 #endif
@@ -986,9 +1004,18 @@ void writeResultFooter(const int errors[], const double bw[], double check_avg_b
   PRINT("#\n");
   PRINT("# Collective test concluded: %s\n", program_name);
 
+#ifdef NCCL_TESTS_EXTENSION
+  // One id per run, shared by the JSON report and any built-in extension.
+  char uuid[37];
+  genUuidV4(uuid);
+  NCCL_TESTS_EXT(nccl_tests_ext_footer(errors[0], bw[0], check_avg_bw, uuid));
+#endif
+
   if(write_json) {
+#ifndef NCCL_TESTS_EXTENSION
     char uuid[37];
     genUuidV4(uuid);
+#endif
     jsonKey("out_of_bounds");
     jsonStartObject();
     jsonKey("count");      jsonInt(errors[0]);
@@ -1047,6 +1074,7 @@ void writeMemInfo(memInfo_t* memInfos, int numMemInfos) {
 // Write out remaining errors to stdout/json.
 void writeErrors() {
   const char *error = ncclGetLastError(NULL);
+  NCCL_TESTS_EXT(nccl_tests_ext_error(error));
   if(error && strlen(error) > 0) {
     PRINT("# error: %s\n", error);
   } else {
