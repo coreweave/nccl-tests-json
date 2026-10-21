@@ -28,13 +28,8 @@ ifeq ($(MPI_IBM),1)
 NVCUFLAGS += -DMPI_SUPPORT
 NVLDFLAGS += -lmpi_ibm
 endif
-# GPU serials use NVML (libnvidia-ml). Link against the CUDA toolkit's NVML stub so
-# the build succeeds on hosts without the driver's -dev symlink; the real
-# libnvidia-ml is loaded at runtime. libuuid was dropped — the JSON UUID is now
-# generated in-tree (genUuidV4 in util.cu), so no uuid-dev is needed to build.
-NVLDFLAGS += -L$(CUDA_HOME)/lib64/stubs
-LIBRARIES += nccl nvidia-ml
-NVLDFLAGS += $(LIBRARIES:%=-l%)
+LIBRARIES += nccl
+NVLDFLAGS += $(LIBRARIES:%=-l%) -ldl
 
 DST_DIR := $(BUILDDIR)
 SRC_FILES := $(wildcard *.cu)
