@@ -500,6 +500,57 @@ int getGPUSerial(const char *pciBusId, char *serial) {
     return 0;
 }
 
+#ifdef NCCL_TESTS_EXTENSION
+#include <dlfcn.h>
+#ifndef NVML_DEVICE_UUID_V2_BUFFER_SIZE
+#define NVML_DEVICE_UUID_V2_BUFFER_SIZE 96
+#endif
+// Per-GPU identity for the built-in extension only. The NVML serial is shared by the GPUs of
+// one module on some boards, so the extension also gets the device UUID. The UUIDs travel in
+// their own gathered buffer, one "device uuid" entry per local GPU, so the printed device
+// lines and the JSON stay identical to a stock build.
+//
+// NVML is already initialized by the NvmlSession in writeDeviceReport. The two symbols this
+// needs come from the driver library by name, so the extension does not depend on how the
+// rest of this file links or loads NVML.
+static int getGPUUuid(const char *pciBusId, char *uuid, size_t len) {
+    typedef nvmlReturn_t (*GetHandleByPciBusIdFn)(const char *, nvmlDevice_t *);
+    typedef nvmlReturn_t (*GetUuidFn)(nvmlDevice_t, char *, unsigned int);
+    void *lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+    if (lib == nullptr) return 1;
+    GetHandleByPciBusIdFn getHandle = (GetHandleByPciBusIdFn)dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2");
+    GetUuidFn getUuid = (GetUuidFn)dlsym(lib, "nvmlDeviceGetUUID");
+    int rc = 1;
+    nvmlDevice_t device;
+    if (getHandle != nullptr && getUuid != nullptr
+        && getHandle(pciBusId, &device) == NVML_SUCCESS
+        && getUuid(device, uuid, (unsigned int)len) == NVML_SUCCESS
+        && uuid[0] != '\0') {
+        rc = 0;
+    }
+    dlclose(lib);
+    return rc;
+}
+
+// Find the uuid recorded for cudaDev in one process's entry buffer. Writes "unknown" when
+// the device has no entry, and returns out either way.
+static const char *extLookupUuid(const char *entries, int cudaDev, char *out, size_t len) {
+    const char *cursor = entries;
+    while (cursor != nullptr && *cursor != '\0') {
+        int dev = -1, consumed = 0;
+        char uuid[NVML_DEVICE_UUID_V2_BUFFER_SIZE];
+        if (sscanf(cursor, "%d %95s\n%n", &dev, uuid, &consumed) != 2 || consumed <= 0) break;
+        if (dev == cudaDev) {
+            snprintf(out, len, "%s", uuid);
+            return out;
+        }
+        cursor += consumed;
+    }
+    snprintf(out, len, "unknown");
+    return out;
+}
+#endif
+
 // Generate an RFC-4122 v4 UUID string (36 chars + NUL) without an external libuuid,
 // so building needs no uuid-dev. Randomness is fine for a per-run identifier.
 static void genUuidV4(char out[37]) {
@@ -684,6 +735,11 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   const int gpu0 = envstr ? atoi(envstr) : -1;
   int available_devices;
   char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
+#ifdef NCCL_TESTS_EXTENSION
+  char extLine[MAX_LINE];
+  int extLen = 0;
+  extLine[0] = '\0';
+#endif
   CUDACHECK(cudaGetDeviceCount(&available_devices));
 
   // Initialize NVML once for the whole device loop; the guard shuts it down on
@@ -720,6 +776,17 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       len += snprintf(line+len, MAX_LINE-len, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%02x:%02x] %s#%s\n",
                       rank, color, getpid(), hostname, cudaDev, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name, gpuSerial);
     }
+#ifdef NCCL_TESTS_EXTENSION
+    {
+      char gpuUuid[NVML_DEVICE_UUID_V2_BUFFER_SIZE];
+      if (!nvml.ready || pciBusId[0] == '\0' || getGPUUuid(pciBusId, gpuUuid, sizeof(gpuUuid)) != 0) {
+        snprintf(gpuUuid, sizeof(gpuUuid), "unknown");
+      }
+      if (extLen < MAX_LINE) {
+        extLen += snprintf(extLine+extLen, MAX_LINE-extLen, "%d %s\n", cudaDev, gpuUuid);
+      }
+    }
+#endif
     *maxMem = std::min(*maxMem, prop.totalGlobalMem);
   }
   // NVML is shut down by the NvmlSession guard when this function returns.
@@ -732,6 +799,10 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   char *lines = (proc == 0) ? (char *)malloc(totalProcs*MAX_LINE) : NULL;
   // Gather all output in rank order to root (0)
   MPI_Gather(line, MAX_LINE, MPI_BYTE, lines, MAX_LINE, MPI_BYTE, 0, MPI_COMM_WORLD);
+#ifdef NCCL_TESTS_EXTENSION
+  char *extLines = (proc == 0) ? (char *)malloc(totalProcs*MAX_LINE) : NULL;
+  MPI_Gather(extLine, MAX_LINE, MPI_BYTE, extLines, MAX_LINE, MPI_BYTE, 0, MPI_COMM_WORLD);
+#endif
   if (proc == 0) {
     if(write_json) {
       jsonKey("devices");
@@ -749,10 +820,14 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
         const char *cursor = lines + MAX_LINE*p;
         rankInfo_t rankinfo;
         int consumed;
+#ifdef NCCL_TESTS_EXTENSION
+        char gpuUuid[NVML_DEVICE_UUID_V2_BUFFER_SIZE];
+#endif
         while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
           if(write_json) jsonRankInfo(&rankinfo);
           NCCL_TESTS_EXT(nccl_tests_ext_device(rankinfo.rank, rankinfo.group, rankinfo.pid, rankinfo.hostname,
-                                                 rankinfo.device, rankinfo.device_hex, rankinfo.devinfo, rankinfo.gpuSerial));
+                                                 rankinfo.device, rankinfo.device_hex, rankinfo.devinfo, rankinfo.gpuSerial,
+                                                 extLookupUuid(extLines + MAX_LINE*p, rankinfo.device, gpuUuid, sizeof(gpuUuid))));
           cursor += consumed;
         }
       }
@@ -761,6 +836,9 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       jsonFinishList();
     }
     free(lines);
+#ifdef NCCL_TESTS_EXTENSION
+    free(extLines);
+#endif
   }
   MPI_Allreduce(MPI_IN_PLACE, maxMem, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
 #else
@@ -777,10 +855,14 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     const char *cursor = line;
     rankInfo_t rankinfo;
     int consumed;
+#ifdef NCCL_TESTS_EXTENSION
+    char gpuUuid[NVML_DEVICE_UUID_V2_BUFFER_SIZE];
+#endif
     while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
       if(write_json) jsonRankInfo(&rankinfo);
       NCCL_TESTS_EXT(nccl_tests_ext_device(rankinfo.rank, rankinfo.group, rankinfo.pid, rankinfo.hostname,
-                                             rankinfo.device, rankinfo.device_hex, rankinfo.devinfo, rankinfo.gpuSerial));
+                                             rankinfo.device, rankinfo.device_hex, rankinfo.devinfo, rankinfo.gpuSerial,
+                                             extLookupUuid(line, rankinfo.device, gpuUuid, sizeof(gpuUuid))));
       cursor += consumed;
     }
   }
