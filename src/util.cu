@@ -11,9 +11,9 @@
 // library for an external JSON utility.
 //
 // However, this means that the code is a brittle to changes and care
-// should be taken when adding/removing things. We also essentially
-// give up when passed non-ASCII strings and non-printable characters
-// except some of the usual ones.
+// should be taken when adding/removing things. Strings are treated as
+// UTF-8. Well-formed sequences pass through, malformed bytes become
+// U+FFFD, and control characters are escaped.
 
 #include "nccl.h"
 #include "util.h"
@@ -24,6 +24,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <dlfcn.h>
 #include <nvml.h>
 #include <random>
 
@@ -49,9 +50,13 @@ extern int unalign;
 static FILE *json_report_fp;
 static thread_local bool write_json;
 
+// This output extends upstream nccl-tests schema version JSON_FILE_VERSION.
+// JSON_SCHEMA_VARIANT identifies the revision of the CoreWeave additions
+// to it and is bumped independently of upstream.
 #define JSON_FILE_VERSION 1
+#define JSON_SCHEMA_VARIANT "coreweave-1"
 
-#define TIME_STRING_FORMAT "%Y-%m-%d %H:%M:%SZ"
+#define TIME_STRING_FORMAT "%Y-%m-%dT%H:%M:%SZ"
 
 typedef enum {
   JSON_NONE, // A pseudo-state meaning that the document is empty
@@ -68,55 +73,88 @@ json_state_t *states = nullptr;
 size_t state_cap = 0; // Allocated stack capacity
 size_t state_n = 0;   // # of items in the stack.
 
-// This tries to sanitize/quote a string from 'in' into 'out',
-// assuming 'out' has length 'lim'.  We mainly quote ",/,\,\t,\n, and
-// bail if we encounter non-printable stuff or non-ASCII stuff.
-// 'in' should be null-terminated, of course.
-//
-// We return false if we were not able to copy all of 'in', either for
-// length reasons or for unhandled characters.
-static bool sanitizeJson(char out[], int lim, const char *in) {
-  int c = 0;
-  while(*in) {
-    if(c+1 >= lim) {
-      out[c] = 0;
-      return false;
-    }
-    switch(*in) {
-    case '"':
-    case '\\':
-    case '/':
-    case '\t':
-    case '\n':
-      // Two escaped bytes plus the terminating NUL must fit.
-      if(c + 2 >= lim) {
-        out[c] = 0;
-        return false;
-      }
+// Longest input, in bytes, that jsonWriteQuoted consumes from one string.
+#define JSON_STRING_MAX_BYTES (2u << 20)
 
-      out[c++] = '\\';
-      if(*in == '\n') {
-        out[c++] = 'n';
+// Return the length of the well-formed UTF-8 sequence starting at 'in',
+// or 0 if the bytes at 'in' do not begin one. Single ASCII bytes count
+// as a sequence of length 1. The ranges follow the Unicode standard's
+// table of well-formed byte sequences, so overlong encodings, surrogate
+// code points, and values above U+10FFFF are all rejected.
+static int utf8SequenceLength(const unsigned char *in) {
+  const unsigned char b0 = in[0];
+  if (b0 < 0x80) return 1;
+  if (b0 < 0xC2) return 0;
+
+  unsigned char lo = 0x80, hi = 0xBF;
+  int len;
+  if (b0 <= 0xDF) {
+    len = 2;
+  }
+  else if (b0 <= 0xEF) {
+    len = 3;
+    if (b0 == 0xE0) lo = 0xA0;
+    if (b0 == 0xED) hi = 0x9F;
+  }
+  else if (b0 <= 0xF4) {
+    len = 4;
+    if (b0 == 0xF0) lo = 0x90;
+    if (b0 == 0xF4) hi = 0x8F;
+  }
+  else {
+    return 0;
+  }
+
+  if (in[1] < lo || in[1] > hi) return 0;
+  for (int i = 2; i < len; i++) {
+    if (in[i] < 0x80 || in[i] > 0xBF) return 0;
+  }
+  return len;
+}
+
+// Write 'in' to json_report_fp as a double-quoted JSON string.
+// The input is read as UTF-8. Well-formed sequences are copied through,
+// each malformed byte becomes U+FFFD, and control characters are
+// escaped. Reading stops after JSON_STRING_MAX_BYTES of input.
+static void jsonWriteQuoted(const char *in) {
+  const unsigned char *p = (const unsigned char *)in;
+  size_t consumed = 0;
+  fputc('"', json_report_fp);
+  while (*p && consumed < JSON_STRING_MAX_BYTES) {
+    const unsigned char c = *p;
+    int advance = 1;
+    switch (c) {
+    case '"':  fputs("\\\"", json_report_fp); break;
+    case '\\': fputs("\\\\", json_report_fp); break;
+    case '/':  fputs("\\/", json_report_fp); break;
+    case '\n': fputs("\\n", json_report_fp); break;
+    case '\t': fputs("\\t", json_report_fp); break;
+    case '\r': fputs("\\r", json_report_fp); break;
+    case '\b': fputs("\\b", json_report_fp); break;
+    case '\f': fputs("\\f", json_report_fp); break;
+    default:
+      if (c < 0x20 || c == 0x7F) {
+        fprintf(json_report_fp, "\\u%04x", c);
       }
-      else if( *in == '\t') {
-        out[c++] = 't';
+      else if (c < 0x80) {
+        fputc(c, json_report_fp);
       }
       else {
-        out[c++] = *in;
+        const int len = utf8SequenceLength(p);
+        if (len == 0) {
+          fputs("\xEF\xBF\xBD", json_report_fp);
+        }
+        else {
+          fwrite(p, 1, len, json_report_fp);
+          advance = len;
+        }
       }
-      break;
-    default:
-      if (*in >= 0x7F || *in <= 0x1F) {
-        out[c] = 0;
-        return false;
-      }
-      out[c++] = *in;
       break;
     }
-    ++in;
+    p += advance;
+    consumed += advance;
   }
-  out[c] = 0;
-  return true;
+  fputc('"', json_report_fp);
 }
 
 // Push state onto the state stack. Reallocate for extra storage if needed.
@@ -169,11 +207,8 @@ static void jsonKey(const char *name) {
     assert(0);
     break;
   }
-  char tmp[2048];
-  if(!sanitizeJson(tmp, sizeof(tmp), name)) {
-    fprintf(stderr, "JSON key was truncated at %zu bytes or contained unsupported characters.\n", sizeof(tmp)-1);
-  }
-  fprintf(json_report_fp, "\"%s\":", tmp);
+  jsonWriteQuoted(name);
+  fputc(':', json_report_fp);
   jsonPushState(JSON_KEY);
 }
 
@@ -267,16 +302,13 @@ static void jsonStr(const char *str) {
     return;
   }
   jsonValHelper();
-  char tmp[2048];
-  if(!sanitizeJson(tmp, sizeof(tmp), str)) {
-    fprintf(stderr, "JSON string was truncated at %zu bytes or contained unsupported characters.\n", sizeof(tmp)-1);
-  }
-  fprintf(json_report_fp, "\"%s\"", tmp);
+  jsonWriteQuoted(str);
 }
 
-// Write a bool as "true" or "false" strings.
+// Write a bool as a true or false literal.
 static void jsonBool(bool val) {
-  jsonStr(val ? "true" : "false");
+  jsonValHelper();
+  fputs(val ? "true" : "false", json_report_fp);
 }
 
 // Write an integer value
@@ -363,6 +395,7 @@ void jsonOutputInit(const char *in_path,
   jsonStartObject(); // will be closed finalize_json_output
 
   jsonKey("version"); jsonInt(JSON_FILE_VERSION);
+  jsonKey("schema_variant"); jsonStr(JSON_SCHEMA_VARIANT);
 
   jsonKey("start_time");
   {
@@ -431,6 +464,10 @@ struct rankInfo_t {
   char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
 };
 
+// Serial printed on stdout for a GPU whose serial could not be read.
+// jsonRankInfo turns it back into a JSON null.
+static const char UNKNOWN_SERIAL[] = "unknown";
+
 // Helper function to parse one device-info line (as gathered to the root rank).
 // This fills 'rank' with the parsed contents at the start of 'instring' and
 // returns the number of bytes consumed, so the caller can advance to the next
@@ -473,39 +510,88 @@ static void jsonRankInfo(const rankInfo_t *ri) {
   jsonKey("device");      jsonInt(ri->device);
   jsonKey("device_hex");  jsonStr(ri->device_hex);
   jsonKey("device_info"); jsonStr(ri->devinfo);
-  jsonKey("serial");      jsonStr(ri->gpuSerial);
+  jsonKey("serial");
+  if (strcmp(ri->gpuSerial, UNKNOWN_SERIAL) == 0) {
+    jsonNull();
+  }
+  else {
+    jsonStr(ri->gpuSerial);
+  }
   jsonFinishObject();
 }
 
+// NVML loaded from the driver's libnvidia-ml.so.1 at runtime. 'ready' is
+// true only when the library and every needed symbol resolved and
+// nvmlInit succeeded. The destructor shuts NVML down and unloads the
+// library on every exit path from the owning scope.
+struct NvmlSession {
+  typedef nvmlReturn_t (*InitFn)();
+  typedef nvmlReturn_t (*ShutdownFn)();
+  typedef nvmlReturn_t (*GetHandleByPciBusIdFn)(const char *, nvmlDevice_t *);
+  typedef nvmlReturn_t (*GetSerialFn)(nvmlDevice_t, char *, unsigned int);
+  typedef const char *(*ErrorStringFn)(nvmlReturn_t);
 
-// Fetch the serial number for one GPU into `serial` (must hold at least
-// NVML_DEVICE_SERIAL_BUFFER_SIZE bytes). NVML must already be initialized by the
-// caller. Returns 0 on success, nonzero if the handle or serial
-// lookup fails (in which case `serial` is left untouched for the caller to handle).
-int getGPUSerial(const char *pciBusId, char *serial) {
-    nvmlDevice_t device;
+  void *lib = nullptr;
+  InitFn init = nullptr;
+  ShutdownFn shutdown = nullptr;
+  GetHandleByPciBusIdFn getHandleByPciBusId = nullptr;
+  GetSerialFn getSerial = nullptr;
+  ErrorStringFn errorString = nullptr;
+  bool ready = false;
 
-    // Look up by PCI bus id, not NVML index: NVML's index space is PCI-ordered and
-    // ignores CUDA_VISIBLE_DEVICES, whereas the caller's cudaDev is a CUDA runtime
-    // ordinal that CUDA_VISIBLE_DEVICES / containers / schedulers remap. Keying by
-    // the stable bus id guarantees the serial matches the GPU this rank actually uses.
-    nvmlReturn_t result = nvmlDeviceGetHandleByPciBusId(pciBusId, &device);
-    if (NVML_SUCCESS != result) {
-        fprintf(stderr, "Failed to get device handle for PCI %s: %s\n", pciBusId, nvmlErrorString(result));
-        return 1;
+  NvmlSession() {
+    lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+    if (lib == nullptr) return;
+    init = (InitFn)dlsym(lib, "nvmlInit_v2");
+    shutdown = (ShutdownFn)dlsym(lib, "nvmlShutdown");
+    getHandleByPciBusId = (GetHandleByPciBusIdFn)dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2");
+    getSerial = (GetSerialFn)dlsym(lib, "nvmlDeviceGetSerial");
+    errorString = (ErrorStringFn)dlsym(lib, "nvmlErrorString");
+    if (!init || !shutdown || !getHandleByPciBusId || !getSerial || !errorString) return;
+    ready = (init() == NVML_SUCCESS);
+  }
+
+  ~NvmlSession() {
+    if (ready && shutdown() != NVML_SUCCESS) {
+      fprintf(stderr, "Failed to shut down NVML.\n");
     }
-
-    result = nvmlDeviceGetSerial(device, serial, NVML_DEVICE_SERIAL_BUFFER_SIZE);
-    if (NVML_SUCCESS != result) {
-        fprintf(stderr, "Failed to get serial number for PCI %s: %s\n", pciBusId, nvmlErrorString(result));
-        return 1;
+    if (lib != nullptr) {
+      dlclose(lib);
     }
-    if (serial[0] == '\0') {
-        fprintf(stderr, "Failed to get serial number for PCI %s: empty serial\n", pciBusId);
-        return 1;
-    }
+  }
 
-    return 0;
+  NvmlSession(const NvmlSession&) = delete;
+  NvmlSession& operator=(const NvmlSession&) = delete;
+};
+
+// Fetch the serial number for the GPU at 'pciBusId' into 'serial', which
+// must hold NVML_DEVICE_SERIAL_BUFFER_SIZE bytes. 'nvml' must be ready.
+// Returns 0 on success and nonzero when the handle or serial lookup
+// fails or the serial comes back empty.
+static int getGPUSerial(const NvmlSession &nvml, const char *pciBusId, char *serial) {
+  nvmlDevice_t device;
+
+  // Look up by PCI bus id, not NVML index: NVML's index space is PCI-ordered and
+  // ignores CUDA_VISIBLE_DEVICES, whereas the caller's cudaDev is a CUDA runtime
+  // ordinal that CUDA_VISIBLE_DEVICES / containers / schedulers remap. Keying by
+  // the stable bus id guarantees the serial matches the GPU this rank actually uses.
+  nvmlReturn_t result = nvml.getHandleByPciBusId(pciBusId, &device);
+  if (NVML_SUCCESS != result) {
+    fprintf(stderr, "Failed to get device handle for PCI %s: %s\n", pciBusId, nvml.errorString(result));
+    return 1;
+  }
+
+  result = nvml.getSerial(device, serial, NVML_DEVICE_SERIAL_BUFFER_SIZE);
+  if (NVML_SUCCESS != result) {
+    fprintf(stderr, "Failed to get serial number for PCI %s: %s\n", pciBusId, nvml.errorString(result));
+    return 1;
+  }
+  if (serial[0] == '\0') {
+    fprintf(stderr, "Failed to get serial number for PCI %s: empty serial\n", pciBusId);
+    return 1;
+  }
+
+  return 0;
 }
 
 // Generate an RFC-4122 v4 UUID string (36 chars + NUL) without an external libuuid,
@@ -526,22 +612,6 @@ static void genUuidV4(char out[37]) {
         "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
         b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
 }
-
-// RAII owner for the NVML library handle. Initializes NVML on construction and
-// guarantees a single shutdown when the scope exits, on any path (normal return,
-// early error return, exception). `ready` reflects whether init succeeded; a
-// failed init means serials are unavailable but the rest of the report proceeds.
-struct NvmlSession {
-  const bool ready;
-  NvmlSession() : ready(nvmlInit() == NVML_SUCCESS) {}
-  ~NvmlSession() {
-    if (ready && nvmlShutdown() != NVML_SUCCESS) {
-      fprintf(stderr, "Failed to shut down NVML.\n");
-    }
-  }
-  NvmlSession(const NvmlSession&) = delete;
-  NvmlSession& operator=(const NvmlSession&) = delete;
-};
 
 // Write the start of a benchmark output line containing the bytes &
 // op type, both to stdout and to json if we are writing there.
@@ -692,7 +762,7 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   // every exit path from here on (see NvmlSession).
   NvmlSession nvml;
   if (!nvml.ready) {
-    fprintf(stderr, "Failed to initialize NVML; GPU serials will be reported as \"unknown\".\n");
+    fprintf(stderr, "Failed to initialize NVML; GPU serials will be reported as \"%s\".\n", UNKNOWN_SERIAL);
   }
 
   for (int i=0; i<nThreads*nGpus; i++) {
@@ -713,10 +783,10 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     char pciBusId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE] = {0};
     if (!nvml.ready
         || cudaDeviceGetPCIBusId(pciBusId, sizeof(pciBusId), cudaDev) != cudaSuccess
-        || getGPUSerial(pciBusId, gpuSerial) != 0) {
+        || getGPUSerial(nvml, pciBusId, gpuSerial) != 0) {
       // NVML unavailable or this device's lookup failed — write a defined value
       // rather than emit uninitialized/stale bytes into the report (and JSON serial).
-      snprintf(gpuSerial, sizeof(gpuSerial), "unknown");
+      snprintf(gpuSerial, sizeof(gpuSerial), "%s", UNKNOWN_SERIAL);
     }
     if (len < MAX_LINE) {
       len += snprintf(line+len, MAX_LINE-len, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%02x:%02x] %s#%s\n",
