@@ -330,7 +330,7 @@ static void jsonDouble(const double val) {
     fprintf(json_report_fp, "\"nan\"");
   }
   else if(isinf(val)) {
-    // JSON has no infinity literal; emit a string, matching the "nan" handling above.
+    // JSON has no infinity literal, so this is a string like the "nan" case above.
     fprintf(json_report_fp, val < 0 ? "\"-inf\"" : "\"inf\"");
   }
   else {
@@ -468,14 +468,12 @@ struct rankInfo_t {
 // jsonRankInfo turns it back into a JSON null.
 static const char UNKNOWN_SERIAL[] = "unknown";
 
-// Helper function to parse one device-info line (as gathered to the root rank).
-// This fills 'rank' with the parsed contents at the start of 'instring' and
-// returns the number of bytes consumed, so the caller can advance to the next
-// line and parse again — a single process may report several GPUs, hence
-// several lines, in one buffer. Returns 0 when no complete record is present
-// (end of buffer / trailing garbage), which lets callers loop until exhausted.
-// The sscanf format below hardcodes the gpuSerial field width (%29); this guards
-// against NVML_DEVICE_SERIAL_BUFFER_SIZE drifting out from under that magic number.
+// Parse the "# Rank" line at the start of 'instring' into 'rank' and return
+// the number of bytes consumed, or 0 when no complete record starts there.
+// A process writes one such line for each of its GPUs, so callers advance by
+// the returned count and parse again until 0.
+// The sscanf format below stores at most 29 characters plus a NUL into
+// gpuSerial, whose size comes from NVML_DEVICE_SERIAL_BUFFER_SIZE.
 static_assert(sizeof(rankInfo_t::gpuSerial) == 30,
               "parseRankInfo assumes that rankInfo_t::gpuSerial has a width of 30 bytes.");
 static int parseRankInfo(rankInfo_t *rank, const char *instring) {
@@ -571,10 +569,8 @@ struct NvmlSession {
 static int getGPUSerial(const NvmlSession &nvml, const char *pciBusId, char *serial) {
   nvmlDevice_t device;
 
-  // Look up by PCI bus id, not NVML index: NVML's index space is PCI-ordered and
-  // ignores CUDA_VISIBLE_DEVICES, whereas the caller's cudaDev is a CUDA runtime
-  // ordinal that CUDA_VISIBLE_DEVICES / containers / schedulers remap. Keying by
-  // the stable bus id guarantees the serial matches the GPU this rank actually uses.
+  // The PCI bus id identifies the physical device, while CUDA ordinals are
+  // remapped by CUDA_VISIBLE_DEVICES and do not line up with NVML indices.
   nvmlReturn_t result = nvml.getHandleByPciBusId(pciBusId, &device);
   if (NVML_SUCCESS != result) {
     fprintf(stderr, "Failed to get device handle for PCI %s: %s\n", pciBusId, nvml.errorString(result));
@@ -594,23 +590,22 @@ static int getGPUSerial(const NvmlSession &nvml, const char *pciBusId, char *ser
   return 0;
 }
 
-// Generate an RFC-4122 v4 UUID string (36 chars + NUL) without an external libuuid,
-// so building needs no uuid-dev. Randomness is fine for a per-run identifier.
+// Write a random RFC 4122 version 4 UUID into 'out' as 36 characters plus NUL.
 static void genUuidV4(char out[37]) {
-    std::random_device rd;
-    unsigned char b[16];
-    for (int i = 0; i < 16; i += 4) {
-        unsigned int r = rd();
-        b[i+0] =  r        & 0xFF;
-        b[i+1] = (r >> 8)  & 0xFF;
-        b[i+2] = (r >> 16) & 0xFF;
-        b[i+3] = (r >> 24) & 0xFF;
-    }
-    b[6] = (b[6] & 0x0F) | 0x40;  // version 4
-    b[8] = (b[8] & 0x3F) | 0x80;  // variant 10x
-    snprintf(out, 37,
-        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+  std::random_device rd;
+  unsigned char b[16];
+  for (int i = 0; i < 16; i += 4) {
+    unsigned int r = rd();
+    b[i+0] =  r        & 0xFF;
+    b[i+1] = (r >> 8)  & 0xFF;
+    b[i+2] = (r >> 16) & 0xFF;
+    b[i+3] = (r >> 24) & 0xFF;
+  }
+  b[6] = (b[6] & 0x0F) | 0x40;  // version 4
+  b[8] = (b[8] & 0x3F) | 0x80;  // variant 10x
+  snprintf(out, 37,
+      "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+      b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
 }
 
 // Write the start of a benchmark output line containing the bytes &
@@ -758,8 +753,6 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
   CUDACHECK(cudaGetDeviceCount(&available_devices));
 
-  // Initialize NVML once for the whole device loop; the guard shuts it down on
-  // every exit path from here on (see NvmlSession).
   NvmlSession nvml;
   if (!nvml.ready) {
     fprintf(stderr, "Failed to initialize NVML; GPU serials will be reported as \"%s\".\n", UNKNOWN_SERIAL);
@@ -776,16 +769,10 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       return testNotImplemented;
     }
     CUDACHECK(cudaGetDeviceProperties(&prop, cudaDev));
-    // Resolve the serial by stable PCI bus id (see getGPUSerial): cudaDev is a CUDA
-    // ordinal that CUDA_VISIBLE_DEVICES can remap, so an NVML-by-index lookup could
-    // return another GPU's serial. cudaDeviceGetPCIBusId yields the "dddd:bb:dd.f"
-    // string NVML expects.
     char pciBusId[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE] = {0};
     if (!nvml.ready
         || cudaDeviceGetPCIBusId(pciBusId, sizeof(pciBusId), cudaDev) != cudaSuccess
         || getGPUSerial(nvml, pciBusId, gpuSerial) != 0) {
-      // NVML unavailable or this device's lookup failed — write a defined value
-      // rather than emit uninitialized/stale bytes into the report (and JSON serial).
       snprintf(gpuSerial, sizeof(gpuSerial), "%s", UNKNOWN_SERIAL);
     }
     if (len < MAX_LINE) {
@@ -794,7 +781,6 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     }
     *maxMem = std::min(*maxMem, prop.totalGlobalMem);
   }
-  // NVML is shut down by the NvmlSession guard when this function returns.
 
   if (len >= MAX_LINE) {
     strcpy(line+MAX_LINE-5, "...\n");
@@ -812,11 +798,8 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     for (int p = 0; p < totalProcs; p++) {
       PRINT("%s", lines+MAX_LINE*p);
       if(write_json) {
-        // A process that drives multiple GPUs contributes multiple "# Rank"
-        // lines in its MAX_LINE buffer; walk them all so every GPU's serial is
-        // emitted, not just the first. parseRankInfo returns the bytes consumed
-        // (0 at end-of-buffer); the buffer is NUL-terminated within MAX_LINE, so
-        // the walk cannot run past rank p into rank p+1.
+        // Each process's buffer is NUL-terminated within its MAX_LINE slot, so
+        // the walk stops before reaching the next process's slot.
         const char *cursor = lines + MAX_LINE*p;
         rankInfo_t rankinfo;
         int consumed;
@@ -837,9 +820,6 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   if(write_json) {
     jsonKey("devices");
     jsonStartList();
-    // This process may own several GPUs (nThreads*nGpus > 1), so it wrote one
-    // "# Rank" line per GPU into 'line'. Walk every line so each GPU's serial is
-    // emitted, instead of parsing only the first.
     const char *cursor = line;
     rankInfo_t rankinfo;
     int consumed;
