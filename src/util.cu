@@ -349,15 +349,40 @@ void formatNow(char *buff, int len) {
   strftime(buff, len, TIME_STRING_FORMAT, timeinfo);
 }
 
-// Names containing any of these, compared without regard to case, mark
-// variables that hold credentials, deployment details or personal
-// identifiers, none of which bear on NCCL performance. Such variables are
-// left out of the env array.
+// Only variables whose names start with one of these prefixes, or equal one
+// of the names that follow, reach the env array. The rest of the environment
+// has no bearing on NCCL performance. All name tables in this section are
+// compared without regard to case.
+static const char *const RELEVANT_ENV_NAME_PREFIXES[] = {
+  "NCCL_", "UCX_", "UCC_", "HCOLL_", "SHARP_", "OMPI_", "OPAL_", "PRTE_",
+  "PMIX_", "PMI_", "MPICH_", "I_MPI_", "SLURM_", "SLURMD_", "CUDA_",
+  "NVIDIA_", "NV_", "GDRCOPY_", "MLX5_", "RDMAV_", "IBV_",
+};
+static const char *const RELEVANT_ENV_NAMES[] = {
+  "LD_LIBRARY_PATH", "LD_PRELOAD",
+};
+
+// Variables that pass the tables above but carry a username rather than a
+// setting.
+static const char *const DENIED_ENV_NAMES[] = {
+  "SLURM_JOB_USER",
+};
+
+// Names containing any of these mark variables that hold credentials or
+// deployment details, such as a hand-rolled SLURM_API_KEY. They are left
+// out of the env array unless the name also contains one of
+// EXEMPT_ENV_NAME_PARTS.
 static const char *const SENSITIVE_ENV_NAME_PARTS[] = {
   "KEY", "TOKEN", "SECRET", "PASS", "PWD", "CRED", "AUTH", "PRIVATE",
   "SIGNING", "SIGNATURE", "HMAC", "SALT", "JWT", "BEARER", "COOKIE",
   "SESSION", "LICENSE", "LICENCE", "DSN", "URL", "DATABASE", "REDIS",
   "MONGODB", "CONNECTION_STRING", "USERNAME", "EMAIL",
+};
+
+// InfiniBand partition keys such as NCCL_IB_PKEY and UCX_IB_PKEY are
+// settings, not secrets, and stay in despite matching KEY above.
+static const char *const EXEMPT_ENV_NAME_PARTS[] = {
+  "PKEY",
 };
 
 // Values that begin with any of these, compared exactly, are credentials
@@ -376,48 +401,37 @@ static const char *const SECRET_VALUE_PREFIXES[] = {
   "Bearer ",
 };
 
-// Variables with exactly these names, or names starting with one of the
-// prefixes below, describe the submitting user's account, shell, terminal,
-// locale or SSH session, or configure tooling unrelated to NCCL. They are
-// compared without regard to case and left out of the env array. Names are
-// matched whole or by prefix rather than by substring so that CUDA_HOME,
-// NCCL_HOME and MPI_HOME stay in.
-static const char *const IRRELEVANT_ENV_NAMES[] = {
-  "HOME", "LOGNAME", "MAIL", "SHELL", "SHLVL", "EDITOR", "VISUAL", "PAGER",
-  "LS_COLORS", "DISPLAY", "WAYLAND_DISPLAY", "WINDOWID", "STY", "TZ",
-  "COLUMNS", "LINES", "PS1", "PS2", "FPATH", "_",
-};
-static const char *const IRRELEVANT_ENV_NAME_PREFIXES[] = {
-  "USER", "SUDO_", "LANG", "LC_", "SSH_", "XDG_", "DBUS_", "GPG_", "TERM",
-  "LESS", "HIST", "TMUX", "PROMPT", "ZSH", "BASH_", "P9K_", "POWERLEVEL9K_",
-  "STARSHIP_", "HF_", "WANDB_",
-};
-
 static const char ENV_REDACTED_VALUE[] = "<redacted>";
 
-// Return true when the variable name in [name, nameEnd) contains one of
-// SENSITIVE_ENV_NAME_PARTS.
-static bool envNameIsSensitive(const char *name, const char *nameEnd) {
+// The three matchers below compare the variable name in [name, nameEnd)
+// against a table without regard to case.
+template <size_t N>
+static bool envNameStartsWith(const char *name, const char *nameEnd, const char *const (&prefixes)[N]) {
   const size_t nameLen = nameEnd - name;
-  for (const char *part : SENSITIVE_ENV_NAME_PARTS) {
-    const size_t partLen = strlen(part);
-    for (size_t i = 0; i + partLen <= nameLen; i++) {
-      if (strncasecmp(name + i, part, partLen) == 0) return true;
-    }
+  for (const char *prefix : prefixes) {
+    const size_t prefixLen = strlen(prefix);
+    if (prefixLen <= nameLen && strncasecmp(name, prefix, prefixLen) == 0) return true;
   }
   return false;
 }
 
-// Return true when the variable name in [name, nameEnd) equals one of
-// IRRELEVANT_ENV_NAMES or starts with one of IRRELEVANT_ENV_NAME_PREFIXES.
-static bool envNameIsIrrelevant(const char *name, const char *nameEnd) {
+template <size_t N>
+static bool envNameEquals(const char *name, const char *nameEnd, const char *const (&wholes)[N]) {
   const size_t nameLen = nameEnd - name;
-  for (const char *whole : IRRELEVANT_ENV_NAMES) {
+  for (const char *whole : wholes) {
     if (strlen(whole) == nameLen && strncasecmp(name, whole, nameLen) == 0) return true;
   }
-  for (const char *prefix : IRRELEVANT_ENV_NAME_PREFIXES) {
-    const size_t prefixLen = strlen(prefix);
-    if (prefixLen <= nameLen && strncasecmp(name, prefix, prefixLen) == 0) return true;
+  return false;
+}
+
+template <size_t N>
+static bool envNameContains(const char *name, const char *nameEnd, const char *const (&parts)[N]) {
+  const size_t nameLen = nameEnd - name;
+  for (const char *part : parts) {
+    const size_t partLen = strlen(part);
+    for (size_t i = 0; i + partLen <= nameLen; i++) {
+      if (strncasecmp(name + i, part, partLen) == 0) return true;
+    }
   }
   return false;
 }
@@ -435,7 +449,11 @@ static bool envValueLooksSecret(const char *value) {
 static void jsonEnvEntry(const char *entry) {
   const char *eq = strchr(entry, '=');
   const char *nameEnd = eq ? eq : entry + strlen(entry);
-  if (envNameIsSensitive(entry, nameEnd) || envNameIsIrrelevant(entry, nameEnd)) return;
+  if (!envNameStartsWith(entry, nameEnd, RELEVANT_ENV_NAME_PREFIXES)
+      && !envNameEquals(entry, nameEnd, RELEVANT_ENV_NAMES)) return;
+  if (envNameEquals(entry, nameEnd, DENIED_ENV_NAMES)) return;
+  if (envNameContains(entry, nameEnd, SENSITIVE_ENV_NAME_PARTS)
+      && !envNameContains(entry, nameEnd, EXEMPT_ENV_NAME_PARTS)) return;
   if (eq && envValueLooksSecret(eq + 1)) {
     char *redacted = nullptr;
     if (asprintf(&redacted, "%.*s=%s", (int)(eq - entry), entry, ENV_REDACTED_VALUE) != -1) {
