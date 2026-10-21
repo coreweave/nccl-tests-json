@@ -22,6 +22,7 @@
 #include <string>
 #include <iomanip>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <math.h>
 #include <dlfcn.h>
@@ -348,6 +349,104 @@ void formatNow(char *buff, int len) {
   strftime(buff, len, TIME_STRING_FORMAT, timeinfo);
 }
 
+// Names containing any of these, compared without regard to case, mark
+// variables that hold credentials, deployment details or personal
+// identifiers, none of which bear on NCCL performance. Such variables are
+// left out of the env array.
+static const char *const SENSITIVE_ENV_NAME_PARTS[] = {
+  "KEY", "TOKEN", "SECRET", "PASS", "PWD", "CRED", "AUTH", "PRIVATE",
+  "SIGNING", "SIGNATURE", "HMAC", "SALT", "JWT", "BEARER", "COOKIE",
+  "SESSION", "LICENSE", "LICENCE", "DSN", "URL", "DATABASE", "REDIS",
+  "MONGODB", "CONNECTION_STRING", "USERNAME", "EMAIL",
+};
+
+// Values that begin with any of these, compared exactly, are credentials
+// issued by a known service. The variable stays in the env array with its
+// value replaced by ENV_REDACTED_VALUE.
+static const char *const SECRET_VALUE_PREFIXES[] = {
+  "sk-", "sk_", "rk_",                              // OpenAI, Anthropic, Stripe
+  "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+  "glpat-",                                         // GitLab
+  "xox", "xapp-",                                   // Slack
+  "AKIA", "ASIA",                                   // AWS access key ids
+  "AIza", "ya29.",                                  // Google API key, OAuth token
+  "hf_", "npm_", "pypi-", "dop_v1_", "SG.",
+  "eyJ",                                            // base64 JSON, as in a JWT
+  "-----BEGIN",                                     // PEM block
+  "Bearer ",
+};
+
+// Variables with exactly these names, or names starting with one of the
+// prefixes below, describe the submitting user's account, shell, terminal,
+// locale or SSH session, or configure tooling unrelated to NCCL. They are
+// compared without regard to case and left out of the env array. Names are
+// matched whole or by prefix rather than by substring so that CUDA_HOME,
+// NCCL_HOME and MPI_HOME stay in.
+static const char *const IRRELEVANT_ENV_NAMES[] = {
+  "HOME", "LOGNAME", "MAIL", "SHELL", "SHLVL", "EDITOR", "VISUAL", "PAGER",
+  "LS_COLORS", "DISPLAY", "WAYLAND_DISPLAY", "WINDOWID", "STY", "TZ",
+  "COLUMNS", "LINES", "PS1", "PS2", "FPATH", "_",
+};
+static const char *const IRRELEVANT_ENV_NAME_PREFIXES[] = {
+  "USER", "SUDO_", "LANG", "LC_", "SSH_", "XDG_", "DBUS_", "GPG_", "TERM",
+  "LESS", "HIST", "TMUX", "PROMPT", "ZSH", "BASH_", "P9K_", "POWERLEVEL9K_",
+  "STARSHIP_", "HF_", "WANDB_",
+};
+
+static const char ENV_REDACTED_VALUE[] = "<redacted>";
+
+// Return true when the variable name in [name, nameEnd) contains one of
+// SENSITIVE_ENV_NAME_PARTS.
+static bool envNameIsSensitive(const char *name, const char *nameEnd) {
+  const size_t nameLen = nameEnd - name;
+  for (const char *part : SENSITIVE_ENV_NAME_PARTS) {
+    const size_t partLen = strlen(part);
+    for (size_t i = 0; i + partLen <= nameLen; i++) {
+      if (strncasecmp(name + i, part, partLen) == 0) return true;
+    }
+  }
+  return false;
+}
+
+// Return true when the variable name in [name, nameEnd) equals one of
+// IRRELEVANT_ENV_NAMES or starts with one of IRRELEVANT_ENV_NAME_PREFIXES.
+static bool envNameIsIrrelevant(const char *name, const char *nameEnd) {
+  const size_t nameLen = nameEnd - name;
+  for (const char *whole : IRRELEVANT_ENV_NAMES) {
+    if (strlen(whole) == nameLen && strncasecmp(name, whole, nameLen) == 0) return true;
+  }
+  for (const char *prefix : IRRELEVANT_ENV_NAME_PREFIXES) {
+    const size_t prefixLen = strlen(prefix);
+    if (prefixLen <= nameLen && strncasecmp(name, prefix, prefixLen) == 0) return true;
+  }
+  return false;
+}
+
+// Return true when 'value' starts with one of SECRET_VALUE_PREFIXES.
+static bool envValueLooksSecret(const char *value) {
+  for (const char *prefix : SECRET_VALUE_PREFIXES) {
+    if (strncmp(value, prefix, strlen(prefix)) == 0) return true;
+  }
+  return false;
+}
+
+// Write one KEY=VALUE environment entry to the open JSON list, omitting it
+// or redacting its value according to the tables above.
+static void jsonEnvEntry(const char *entry) {
+  const char *eq = strchr(entry, '=');
+  const char *nameEnd = eq ? eq : entry + strlen(entry);
+  if (envNameIsSensitive(entry, nameEnd) || envNameIsIrrelevant(entry, nameEnd)) return;
+  if (eq && envValueLooksSecret(eq + 1)) {
+    char *redacted = nullptr;
+    if (asprintf(&redacted, "%.*s=%s", (int)(eq - entry), entry, ENV_REDACTED_VALUE) != -1) {
+      jsonStr(redacted);
+      free(redacted);
+    }
+    return;
+  }
+  jsonStr(entry);
+}
+
 // We provide some status line to stdout.
 // The JSON stream is left with a trailing comma and the top-level
 // object open for the next set of top-level items (config and
@@ -414,7 +513,7 @@ void jsonOutputInit(const char *in_path,
   jsonKey("env");
   jsonStartList();
   for(char **e = envp; *e; e++) {
-    jsonStr(*e);
+    jsonEnvEntry(*e);
   }
   jsonFinishList();
   jsonKey("nccl_version"); jsonInt(test_ncclVersion);
