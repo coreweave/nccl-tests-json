@@ -396,17 +396,18 @@ void jsonIdentifyWriter(bool is_writer) {
 void jsonOutputFinalize() {
   if(write_json) {
 
-    if(state_n == 1 &&
-       (jsonCurrState() == JSON_OBJECT_EMPTY || jsonCurrState() == JSON_OBJECT_SOME)) {
-      jsonKey("end_time");
-      char timebuffer[128];
-      formatNow(timebuffer, sizeof(timebuffer));
-      jsonStr(timebuffer);
-    }
-
-    while(state_n > 0) {
+    // Close any containers left open by an early exit so end_time lands
+    // in the root object, which jsonOutputInit opened.
+    while(state_n > 1) {
       jsonFinishCurrent();
     }
+
+    jsonKey("end_time");
+    char timebuffer[128];
+    formatNow(timebuffer, sizeof(timebuffer));
+    jsonStr(timebuffer);
+
+    jsonFinishObject();
 
     assert(jsonCurrState() == JSON_NONE);
     free(states);
@@ -453,11 +454,14 @@ static int parseRankInfo(rankInfo_t *rank, const char *instring) {
          rank->devinfo,
          rank->gpuSerial,
          &end);
-  // All 8 fields must be present for a complete record; %n (end) is only
-  // assigned once the scan reaches the trailing newline, i.e. a whole line was
-  // consumed. Anything short of that (end of buffer, "...\n" truncation marker)
-  // yields 0 so the caller's loop terminates.
-  return (matched == 8) ? end : 0;
+  // A record is complete only when all 8 fields matched. A serial containing
+  // a '.' is the "...\n" marker that writeDeviceReport writes over the tail of
+  // a full buffer, and a record carrying it is rejected as well. Returning 0
+  // ends the caller's loop.
+  if (matched != 8 || strchr(rank->gpuSerial, '.') != nullptr) {
+    return 0;
+  }
+  return end;
 }
 
 static void jsonRankInfo(const rankInfo_t *ri) {
@@ -494,6 +498,10 @@ int getGPUSerial(const char *pciBusId, char *serial) {
     result = nvmlDeviceGetSerial(device, serial, NVML_DEVICE_SERIAL_BUFFER_SIZE);
     if (NVML_SUCCESS != result) {
         fprintf(stderr, "Failed to get serial number for PCI %s: %s\n", pciBusId, nvmlErrorString(result));
+        return 1;
+    }
+    if (serial[0] == '\0') {
+        fprintf(stderr, "Failed to get serial number for PCI %s: empty serial\n", pciBusId);
         return 1;
     }
 
@@ -572,13 +580,15 @@ void writeBenchMarkLineNullBody() {
 
 void getFloatStr(double value, int width, char* str) {
   if (isinf(value)) {
-    // +inf would loop forever below (value >= val always true as val wraps);
-    // short-circuit both signs.
+    // The magnitude loop below never ends for +inf, so both signs are
+    // formatted directly.
     sprintf(str, "%*s", width, value < 0 ? "-inf" : "inf");
     return;
   }
+  // Count decimal digits in the integer part. The loop stops at 10^19,
+  // the largest power of ten that fits in a uint64_t, so val never wraps.
   int power = 0;
-  for (uint64_t val = 1; value >= val; val *= 10) power++;
+  for (uint64_t val = 1; power < 19 && value >= val; val *= 10) power++;
 
   if (power < width-2) sprintf(str, "%*.2f", width, value);
   else if (power < width-1) sprintf(str, "%*.1f", width, value);
@@ -781,7 +791,7 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
 // Json results object and contained table list are left open
 void writeResultHeader(bool report_cputime, bool report_timestamps) {
   const char* tsLbl  = report_timestamps ? "timestamp" : "";
-  const int tsPad = report_timestamps ? 19 : 0;
+  const int tsPad = report_timestamps ? 20 : 0;
   const char* tsFmt = report_timestamps ? TIME_STRING_FORMAT : "";
   const char* timeStr = report_cputime ? "cputime" : "time";
   PRINT("#\n");
