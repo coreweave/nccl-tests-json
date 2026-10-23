@@ -665,7 +665,7 @@ void writeBenchmarkLineBody(double timeUsec, double algBw, double busBw, bool re
     PRINT("%21s", timebuffer);
   }
 
-  NCCL_TESTS_EXT(nccl_tests_ext_size_result(out_of_place, timeUsec, algBw, busBw, reportErrors, (long long)wrongElts));
+  NCCL_TESTS_EXT(nccl_tests_ext_size_result(out_of_place, timeUsec, algBw, busBw, reportErrors, (long long)wrongElts, report_cputime ? 1 : 0));
 
   if(write_json) {
     jsonKey(out_of_place ? "out_of_place" : "in_place");
@@ -862,7 +862,7 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       if(write_json) jsonRankInfo(&rankinfo);
       NCCL_TESTS_EXT(nccl_tests_ext_device(rankinfo.rank, rankinfo.group, rankinfo.pid, rankinfo.hostname,
                                              rankinfo.device, rankinfo.device_hex, rankinfo.devinfo, rankinfo.gpuSerial,
-                                             extLookupUuid(line, rankinfo.device, gpuUuid, sizeof(gpuUuid))));
+                                             extLookupUuid(extLine, rankinfo.device, gpuUuid, sizeof(gpuUuid))));
       cursor += consumed;
     }
   }
