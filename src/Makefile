@@ -28,6 +28,12 @@ ifeq ($(MPI_IBM),1)
 NVCUFLAGS += -DMPI_SUPPORT
 NVLDFLAGS += -lmpi_ibm
 endif
+# Optional build-time extension, described in ext_hooks.h. Point EXT_DIR at a tree that provides
+# include/nccl_tests_ext.h and build/libnccltestsext.a. Public builds leave it unset.
+ifneq ($(EXT_DIR),)
+NVCUFLAGS += -DNCCL_TESTS_EXTENSION -I$(EXT_DIR)/include
+NVLDFLAGS += $(EXT_DIR)/build/libnccltestsext.a -ldl
+endif
 # GPU serials use NVML (libnvidia-ml). Link against the CUDA toolkit's NVML stub so
 # the build succeeds on hosts without the driver's -dev symlink; the real
 # libnvidia-ml is loaded at runtime. libuuid was dropped — the JSON UUID is now

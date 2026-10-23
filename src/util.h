@@ -7,6 +7,7 @@
 #define __UTIL_H__
 
 #include "common.h"
+#include "ext_hooks.h"
 
 struct memInfo_t {
   int64_t amount;

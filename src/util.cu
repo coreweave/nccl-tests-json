@@ -500,6 +500,191 @@ int getGPUSerial(const char *pciBusId, char *serial) {
     return 0;
 }
 
+#ifdef NCCL_TESTS_EXTENSION
+#include <ctype.h>
+#include <dlfcn.h>
+#include <dirent.h>
+#include <sched.h>
+#include <unistd.h>
+#ifndef NVML_DEVICE_UUID_V2_BUFFER_SIZE
+#define NVML_DEVICE_UUID_V2_BUFFER_SIZE 96
+#endif
+#ifndef NVML_DEVICE_VBIOS_VERSION_BUFFER_SIZE
+#define NVML_DEVICE_VBIOS_VERSION_BUFFER_SIZE 32
+#endif
+#define EXT_FIELD_LEN 512
+// Per-GPU identity for the built-in extension only. The NVML serial is shared by the GPUs of
+// one module on some boards, so the extension also gets the device UUID. The UUIDs travel in
+// their own gathered buffer, one "device uuid" entry per local GPU, so the printed device
+// lines and the JSON stay identical to a stock build.
+//
+// NVML is already initialized by the NvmlSession in writeDeviceReport. The two symbols this
+// needs come from the driver library by name, so the extension does not depend on how the
+// rest of this file links or loads NVML.
+static int getGPUUuid(const char *pciBusId, char *uuid, size_t len) {
+    typedef nvmlReturn_t (*GetHandleByPciBusIdFn)(const char *, nvmlDevice_t *);
+    typedef nvmlReturn_t (*GetUuidFn)(nvmlDevice_t, char *, unsigned int);
+    void *lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+    if (lib == nullptr) return 1;
+    GetHandleByPciBusIdFn getHandle = (GetHandleByPciBusIdFn)dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2");
+    GetUuidFn getUuid = (GetUuidFn)dlsym(lib, "nvmlDeviceGetUUID");
+    int rc = 1;
+    nvmlDevice_t device;
+    if (getHandle != nullptr && getUuid != nullptr
+        && getHandle(pciBusId, &device) == NVML_SUCCESS
+        && getUuid(device, uuid, (unsigned int)len) == NVML_SUCCESS
+        && uuid[0] != '\0') {
+        rc = 0;
+    }
+    dlclose(lib);
+    return rc;
+}
+
+// VBIOS version of the GPU at pciBusId, read through NVML by name like the UUID above.
+static int getGPUVbios(const char *pciBusId, char *vbios, size_t len) {
+    typedef nvmlReturn_t (*GetHandleByPciBusIdFn)(const char *, nvmlDevice_t *);
+    typedef nvmlReturn_t (*GetVbiosFn)(nvmlDevice_t, char *, unsigned int);
+    void *lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
+    if (lib == nullptr) return 1;
+    GetHandleByPciBusIdFn getHandle = (GetHandleByPciBusIdFn)dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2");
+    GetVbiosFn getVbios = (GetVbiosFn)dlsym(lib, "nvmlDeviceGetVbiosVersion");
+    int rc = 1;
+    nvmlDevice_t device;
+    if (getHandle != nullptr && getVbios != nullptr
+        && getHandle(pciBusId, &device) == NVML_SUCCESS
+        && getVbios(device, vbios, (unsigned int)len) == NVML_SUCCESS
+        && vbios[0] != '\0') {
+        rc = 0;
+    }
+    dlclose(lib);
+    return rc;
+}
+
+// NUMA node of the PCI device from sysfs, or -1 when the kernel does not report one.
+static int getPciNumaNode(const char *pciBusId) {
+    char lower[NVML_DEVICE_PCI_BUS_ID_BUFFER_SIZE];
+    size_t n = 0;
+    for (; pciBusId[n] != '\0' && n + 1 < sizeof(lower); n++) lower[n] = (char)tolower((unsigned char)pciBusId[n]);
+    lower[n] = '\0';
+    // NVML and CUDA use an 8-digit domain, sysfs a 4-digit one.
+    const char *id = (n > 12 && strncmp(lower, "0000", 4) == 0) ? lower + 4 : lower;
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", id);
+    FILE *f = fopen(path, "r");
+    int node = -1;
+    if (f != nullptr) {
+        if (fscanf(f, "%d", &node) != 1) node = -1;
+        fclose(f);
+    }
+    return node;
+}
+
+// Appends the CPUs in set as a compact list such as "0-71,144-215".
+static void cpuSetToList(const cpu_set_t *set, char *out, size_t len) {
+    size_t used = 0;
+    out[0] = '\0';
+    for (int cpu = 0; cpu < CPU_SETSIZE && used + 1 < len; cpu++) {
+        if (!CPU_ISSET(cpu, set)) continue;
+        int last = cpu;
+        while (last + 1 < CPU_SETSIZE && CPU_ISSET(last + 1, set)) last++;
+        int w = (last == cpu) ? snprintf(out + used, len - used, "%s%d", used ? "," : "", cpu)
+                              : snprintf(out + used, len - used, "%s%d-%d", used ? "," : "", cpu, last);
+        if (w < 0 || (size_t)w >= len - used) break;
+        used += (size_t)w;
+        cpu = last;
+    }
+    if (out[0] == '\0') snprintf(out, len, "unknown");
+}
+
+// CPU affinity of this process and the NUMA nodes those CPUs belong to.
+static void getProcessPlacement(char *cpus, size_t cpusLen, char *nodes, size_t nodesLen) {
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) != 0) {
+        snprintf(cpus, cpusLen, "unknown");
+        snprintf(nodes, nodesLen, "unknown");
+        return;
+    }
+    cpuSetToList(&mask, cpus, cpusLen);
+    size_t used = 0;
+    nodes[0] = '\0';
+    for (int node = 0; node < 1024 && used + 1 < nodesLen; node++) {
+        char path[96];
+        snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+        FILE *f = fopen(path, "r");
+        if (f == nullptr) continue;
+        char list[4096] = {0};
+        bool overlap = false;
+        if (fgets(list, sizeof(list), f) != nullptr) {
+            char *save = nullptr;
+            for (char *tok = strtok_r(list, ",\n", &save); tok && !overlap; tok = strtok_r(nullptr, ",\n", &save)) {
+                int a = -1, b = -1;
+                int got = sscanf(tok, "%d-%d", &a, &b);
+                if (got == 1) b = a;
+                for (int c = a; got >= 1 && c <= b && c < CPU_SETSIZE; c++) if (CPU_ISSET(c, &mask)) { overlap = true; break; }
+            }
+        }
+        fclose(f);
+        if (overlap) {
+            int w = snprintf(nodes + used, nodesLen - used, "%s%d", used ? "," : "", node);
+            if (w > 0 && (size_t)w < nodesLen - used) used += (size_t)w;
+        }
+    }
+    if (nodes[0] == '\0') snprintf(nodes, nodesLen, "unknown");
+}
+
+// Extension-only facts gathered with each process's device records. One "P" entry carries the
+// process placement and the extension's own local text, then one "D" entry per local GPU.
+struct ExtDeviceInfo {
+    char uuid[NVML_DEVICE_UUID_V2_BUFFER_SIZE];
+    char vbios[NVML_DEVICE_VBIOS_VERSION_BUFFER_SIZE];
+    int numaNode;
+};
+struct ExtProcessInfo {
+    char cpus[EXT_FIELD_LEN];
+    char cpuNodes[64];
+    char local[EXT_FIELD_LEN * 2];
+};
+
+static void extParseProcess(const char *entries, ExtProcessInfo *out) {
+    snprintf(out->cpus, sizeof(out->cpus), "unknown");
+    snprintf(out->cpuNodes, sizeof(out->cpuNodes), "unknown");
+    out->local[0] = '\0';
+    if (entries == nullptr || strncmp(entries, "P ", 2) != 0) return;
+    char cpus[EXT_FIELD_LEN], nodes[64];
+    int consumed = 0;
+    if (sscanf(entries, "P %511s %63s %n", cpus, nodes, &consumed) < 2) return;
+    snprintf(out->cpus, sizeof(out->cpus), "%s", cpus);
+    snprintf(out->cpuNodes, sizeof(out->cpuNodes), "%s", nodes);
+    const char *rest = entries + consumed;
+    size_t n = strcspn(rest, "\n");
+    if (n >= sizeof(out->local)) n = sizeof(out->local) - 1;
+    memcpy(out->local, rest, n);
+    out->local[n] = '\0';
+}
+
+// Finds the "D" entry for cudaDev. Missing values read "unknown" and -1.
+static void extLookupDevice(const char *entries, int cudaDev, ExtDeviceInfo *out) {
+    snprintf(out->uuid, sizeof(out->uuid), "unknown");
+    snprintf(out->vbios, sizeof(out->vbios), "unknown");
+    out->numaNode = -1;
+    const char *cursor = entries;
+    while (cursor != nullptr && *cursor != '\0') {
+        const char *eol = strchr(cursor, '\n');
+        int dev = -1, node = -1;
+        char uuid[NVML_DEVICE_UUID_V2_BUFFER_SIZE], vbios[NVML_DEVICE_VBIOS_VERSION_BUFFER_SIZE];
+        if (cursor[0] == 'D' && sscanf(cursor, "D %d %95s %31s %d", &dev, uuid, vbios, &node) == 4 && dev == cudaDev) {
+            snprintf(out->uuid, sizeof(out->uuid), "%s", uuid);
+            snprintf(out->vbios, sizeof(out->vbios), "%s", vbios);
+            out->numaNode = node;
+            return;
+        }
+        if (eol == nullptr) break;
+        cursor = eol + 1;
+    }
+}
+#endif
+
 // Generate an RFC-4122 v4 UUID string (36 chars + NUL) without an external libuuid,
 // so building needs no uuid-dev. Randomness is fine for a per-run identifier.
 static void genUuidV4(char out[37]) {
@@ -541,6 +726,7 @@ void writeBenchmarkLinePreamble(size_t nBytes, size_t nElem, const char typeName
   char rootName[100];
   sprintf(rootName, "%6i", root);
   PRINT("%12li  %12li  %8s  %6s  %6s", nBytes, nElem, typeName, opName, rootName);
+  NCCL_TESTS_EXT(nccl_tests_ext_size_begin(nBytes, nElem, typeName, opName, root));
 
   if(write_json) {
     jsonStartObject();
@@ -613,6 +799,8 @@ void writeBenchmarkLineBody(double timeUsec, double algBw, double busBw, bool re
     PRINT("%21s", timebuffer);
   }
 
+  NCCL_TESTS_EXT(nccl_tests_ext_size_result(out_of_place, timeUsec, algBw, busBw, reportErrors, (long long)wrongElts, report_cputime ? 1 : 0));
+
   if(write_json) {
     jsonKey(out_of_place ? "out_of_place" : "in_place");
     jsonStartObject();
@@ -646,6 +834,11 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   if (parallel_init) PRINT("# Parallel Init Enabled: threads call into NcclInitRank concurrently \n");
   PRINT("#\n");
 
+  NCCL_TESTS_EXT(nccl_tests_ext_run_config(program_name, NCCL_TESTS_VERSION, NCCL_VERSION_CODE, test_ncclVersion,
+                                           CUDART_VERSION, nThreads, nGpus, minBytes, maxBytes, stepBytes, stepFactor,
+                                           warmup_iters, iters, agg_iters, datacheck, cudaGraphLaunches, blocking_coll,
+                                           parallel_init));
+
   if(write_json) {
     jsonKey("config");
     jsonStartObject();
@@ -676,6 +869,19 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   const int gpu0 = envstr ? atoi(envstr) : -1;
   int available_devices;
   char gpuSerial[NVML_DEVICE_SERIAL_BUFFER_SIZE];
+#ifdef NCCL_TESTS_EXTENSION
+  char extLine[MAX_LINE];
+  int extLen = 0;
+  extLine[0] = '\0';
+  {
+    char cpus[EXT_FIELD_LEN], cpuNodes[64], local[EXT_FIELD_LEN * 2] = {0};
+    getProcessPlacement(cpus, sizeof(cpus), cpuNodes, sizeof(cpuNodes));
+    NCCL_TESTS_EXT_ALWAYS(nccl_tests_ext_local_info(local, sizeof(local)));
+    for (char *c = local; *c; c++) if (*c == '\n' || *c == '\r') *c = ' ';
+    extLen += snprintf(extLine, MAX_LINE, "P %s %s %s\n", cpus, cpuNodes, local);
+    if (extLen >= MAX_LINE) extLen = MAX_LINE - 1;
+  }
+#endif
   CUDACHECK(cudaGetDeviceCount(&available_devices));
 
   // Initialize NVML once for the whole device loop; the guard shuts it down on
@@ -712,6 +918,24 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       len += snprintf(line+len, MAX_LINE-len, "#  Rank %2d Group %2d Pid %6d on %10s device %2d [%04x:%02x:%02x] %s#%s\n",
                       rank, color, getpid(), hostname, cudaDev, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID, prop.name, gpuSerial);
     }
+#ifdef NCCL_TESTS_EXTENSION
+    {
+      char gpuUuid[NVML_DEVICE_UUID_V2_BUFFER_SIZE];
+      char gpuVbios[NVML_DEVICE_VBIOS_VERSION_BUFFER_SIZE];
+      if (!nvml.ready || pciBusId[0] == '\0' || getGPUUuid(pciBusId, gpuUuid, sizeof(gpuUuid)) != 0) {
+        snprintf(gpuUuid, sizeof(gpuUuid), "unknown");
+      }
+      if (!nvml.ready || pciBusId[0] == '\0' || getGPUVbios(pciBusId, gpuVbios, sizeof(gpuVbios)) != 0) {
+        snprintf(gpuVbios, sizeof(gpuVbios), "unknown");
+      }
+      for (char *c = gpuVbios; *c; c++) if (*c == ' ') *c = '_';
+      int gpuNuma = pciBusId[0] != '\0' ? getPciNumaNode(pciBusId) : -1;
+      if (extLen < MAX_LINE) {
+        int w = snprintf(extLine+extLen, MAX_LINE-extLen, "D %d %s %s %d\n", cudaDev, gpuUuid, gpuVbios, gpuNuma);
+        extLen = (w > 0 && extLen + w < MAX_LINE) ? extLen + w : MAX_LINE - 1;
+      }
+    }
+#endif
     *maxMem = std::min(*maxMem, prop.totalGlobalMem);
   }
   // NVML is shut down by the NvmlSession guard when this function returns.
@@ -724,6 +948,10 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   char *lines = (proc == 0) ? (char *)malloc(totalProcs*MAX_LINE) : NULL;
   // Gather all output in rank order to root (0)
   MPI_Gather(line, MAX_LINE, MPI_BYTE, lines, MAX_LINE, MPI_BYTE, 0, MPI_COMM_WORLD);
+#ifdef NCCL_TESTS_EXTENSION
+  char *extLines = (proc == 0) ? (char *)malloc(totalProcs*MAX_LINE) : NULL;
+  MPI_Gather(extLine, MAX_LINE, MPI_BYTE, extLines, MAX_LINE, MPI_BYTE, 0, MPI_COMM_WORLD);
+#endif
   if (proc == 0) {
     if(write_json) {
       jsonKey("devices");
@@ -731,17 +959,30 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     }
     for (int p = 0; p < totalProcs; p++) {
       PRINT("%s", lines+MAX_LINE*p);
-      if(write_json) {
+      if(write_json || NCCL_TESTS_EXT_ENABLED) {
         // A process that drives multiple GPUs contributes multiple "# Rank"
         // lines in its MAX_LINE buffer; walk them all so every GPU's serial is
         // emitted, not just the first. parseRankInfo returns the bytes consumed
         // (0 at end-of-buffer); the buffer is NUL-terminated within MAX_LINE, so
-        // the walk cannot run past rank p into rank p+1.
+        // the walk cannot run past rank p into rank p+1. A built-in extension,
+        // if present, sees every record too.
         const char *cursor = lines + MAX_LINE*p;
         rankInfo_t rankinfo;
         int consumed;
+#ifdef NCCL_TESTS_EXTENSION
+        ExtProcessInfo extProc;
+        ExtDeviceInfo extDev;
+        extParseProcess(extLines + MAX_LINE*p, &extProc);
+#endif
         while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
-          jsonRankInfo(&rankinfo);
+          if(write_json) jsonRankInfo(&rankinfo);
+#ifdef NCCL_TESTS_EXTENSION
+          extLookupDevice(extLines + MAX_LINE*p, rankinfo.device, &extDev);
+#endif
+          NCCL_TESTS_EXT(nccl_tests_ext_device(rankinfo.rank, rankinfo.group, rankinfo.pid, rankinfo.hostname,
+                                                 rankinfo.device, rankinfo.device_hex, rankinfo.devinfo, rankinfo.gpuSerial,
+                                                 extDev.uuid, extDev.vbios, extDev.numaNode,
+                                                 extProc.cpus, extProc.cpuNodes, extProc.local));
           cursor += consumed;
         }
       }
@@ -750,6 +991,9 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
       jsonFinishList();
     }
     free(lines);
+#ifdef NCCL_TESTS_EXTENSION
+    free(extLines);
+#endif
   }
   MPI_Allreduce(MPI_IN_PLACE, maxMem, 1, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
 #else
@@ -757,16 +1001,33 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
   if(write_json) {
     jsonKey("devices");
     jsonStartList();
+  }
+  if(write_json || NCCL_TESTS_EXT_ENABLED) {
     // This process may own several GPUs (nThreads*nGpus > 1), so it wrote one
     // "# Rank" line per GPU into 'line'. Walk every line so each GPU's serial is
-    // emitted, instead of parsing only the first.
+    // emitted, instead of parsing only the first. A built-in extension, if present,
+    // sees every record too.
     const char *cursor = line;
     rankInfo_t rankinfo;
     int consumed;
+#ifdef NCCL_TESTS_EXTENSION
+    ExtProcessInfo extProc;
+    ExtDeviceInfo extDev;
+    extParseProcess(extLine, &extProc);
+#endif
     while ((consumed = parseRankInfo(&rankinfo, cursor)) > 0) {
-      jsonRankInfo(&rankinfo);
+      if(write_json) jsonRankInfo(&rankinfo);
+#ifdef NCCL_TESTS_EXTENSION
+      extLookupDevice(extLine, rankinfo.device, &extDev);
+#endif
+      NCCL_TESTS_EXT(nccl_tests_ext_device(rankinfo.rank, rankinfo.group, rankinfo.pid, rankinfo.hostname,
+                                             rankinfo.device, rankinfo.device_hex, rankinfo.devinfo, rankinfo.gpuSerial,
+                                             extDev.uuid, extDev.vbios, extDev.numaNode,
+                                             extProc.cpus, extProc.cpuNodes, extProc.local));
       cursor += consumed;
     }
+  }
+  if(write_json) {
     jsonFinishList();
   }
 #endif
@@ -810,9 +1071,12 @@ void writeResultFooter(const int errors[], const double bw[], double check_avg_b
   PRINT("#\n");
   PRINT("# Collective test concluded: %s\n", program_name);
 
+  // One id per run, shared by the JSON report and any built-in extension.
+  char uuid[37];
+  genUuidV4(uuid);
+  NCCL_TESTS_EXT(nccl_tests_ext_footer(errors[0], bw[0], check_avg_bw, uuid));
+
   if(write_json) {
-    char uuid[37];
-    genUuidV4(uuid);
     jsonKey("out_of_bounds");
     jsonStartObject();
     jsonKey("count");      jsonInt(errors[0]);
@@ -871,6 +1135,7 @@ void writeMemInfo(memInfo_t* memInfos, int numMemInfos) {
 // Write out remaining errors to stdout/json.
 void writeErrors() {
   const char *error = ncclGetLastError(NULL);
+  NCCL_TESTS_EXT(nccl_tests_ext_error(error));
   if(error && strlen(error) > 0) {
     PRINT("# error: %s\n", error);
   } else {
