@@ -1216,7 +1216,8 @@ int main(int argc, char* argv[], char **envp) {
   testResult_t result = run();
 
   outputFileFinalize(output_file_type);
-  NCCL_TESTS_EXT(nccl_tests_ext_finalize((int)result));
+  // Every process finalizes, so an extension can act on each node.
+  NCCL_TESTS_EXT_ALWAYS(nccl_tests_ext_finalize((int)result));
 
   TESTCHECK(result);
 
@@ -1259,6 +1260,16 @@ testResult_t run() {
     if (p == proc) break;
     if (hostHashs[p] == hostHashs[proc]) localRank++;
   }
+#if NCCL_TESTS_EXT_ENABLED
+  // Rank 0 picks the run id and every process takes it, so per-node output joins the same run.
+  {
+    char extRunId[64] = {0};
+    if (proc == 0) nccl_tests_ext_run_id(extRunId, sizeof(extRunId));
+    MPI_Bcast(extRunId, sizeof(extRunId), MPI_CHAR, 0, MPI_COMM_WORLD);
+    extRunId[sizeof(extRunId) - 1] = '\0';
+    nccl_tests_ext_run_id_shared(extRunId);
+  }
+#endif
 
   char *splitMaskEnv = NULL;
   if (splitMaskEnv = getenv("NCCL_TESTS_SPLIT_MASK")) {
