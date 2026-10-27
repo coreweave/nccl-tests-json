@@ -1628,7 +1628,7 @@ testResult_t run() {
   {
     const char *extData = NULL;
     size_t extLen = 0;
-    nccl_tests_ext_process_end(&extData, &extLen);
+    nccl_tests_ext_process_end(totalProcs, &extData, &extLen);
     if (extData == NULL || extLen > (size_t)INT_MAX) extLen = 0;
 #ifdef MPI_SUPPORT
     int myLen = (int)extLen;
@@ -1648,6 +1648,11 @@ testResult_t run() {
       // A total past what one gather can address is dropped rather than overflowing.
       if (extTotal > INT_MAX) { for (int p = 0; p < totalProcs; p++) extLens[p] = extDispls[p] = 0; extTotal = 0; }
       extAll = (char *)malloc(extTotal > 0 ? (size_t)extTotal : 1);
+      // Without room on rank 0 nothing is gathered.
+      if (extAll == NULL || extLens == NULL || extDispls == NULL) {
+        if (extLens && extDispls) for (int p = 0; p < totalProcs; p++) extLens[p] = extDispls[p] = 0;
+        extTotal = 0;
+      }
     }
     int sendLen = myLen;
     MPI_Bcast(&extTotal, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
@@ -1656,8 +1661,10 @@ testResult_t run() {
     if (proc == 0) {
       const char **ptrs = (const char **)calloc(totalProcs, sizeof(char *));
       size_t *lens = (size_t *)calloc(totalProcs, sizeof(size_t));
-      for (int p = 0; p < totalProcs; p++) { ptrs[p] = extAll + extDispls[p]; lens[p] = (size_t)extLens[p]; }
-      nccl_tests_ext_process_end_gathered(totalProcs, ptrs, lens);
+      if (extTotal > 0 && ptrs && lens) {
+        for (int p = 0; p < totalProcs; p++) { ptrs[p] = extAll + extDispls[p]; lens[p] = (size_t)extLens[p]; }
+        nccl_tests_ext_process_end_gathered(totalProcs, ptrs, lens);
+      }
       free(ptrs); free(lens); free(extAll); free(extLens); free(extDispls);
     }
 #else
