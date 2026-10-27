@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include "common.h"
+#include <limits.h>
 #include <pthread.h>
 #include <cstdio>
 #include <type_traits>
@@ -1620,6 +1621,50 @@ testResult_t run() {
     writeMemInfo(memInfos, 3);
   }
   finalizeFooter();
+
+#if NCCL_TESTS_EXT_ENABLED
+  // Each process hands the extension's end-of-run text to rank 0, after the communicators
+  // are gone and while MPI is still up.
+  {
+    const char *extData = NULL;
+    size_t extLen = 0;
+    nccl_tests_ext_process_end(&extData, &extLen);
+    if (extData == NULL || extLen > (size_t)INT_MAX) extLen = 0;
+#ifdef MPI_SUPPORT
+    int myLen = (int)extLen;
+    int *extLens = NULL, *extDispls = NULL;
+    char *extAll = NULL;
+    if (proc == 0) {
+      extLens = (int *)calloc(totalProcs, sizeof(int));
+      extDispls = (int *)calloc(totalProcs, sizeof(int));
+    }
+    MPI_Gather(&myLen, 1, MPI_INT, extLens, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    long long extTotal = 0;
+    if (proc == 0) {
+      for (int p = 0; p < totalProcs; p++) {
+        extDispls[p] = (int)extTotal;
+        extTotal += extLens[p];
+      }
+      // A total past what one gather can address is dropped rather than overflowing.
+      if (extTotal > INT_MAX) { for (int p = 0; p < totalProcs; p++) extLens[p] = extDispls[p] = 0; extTotal = 0; }
+      extAll = (char *)malloc(extTotal > 0 ? (size_t)extTotal : 1);
+    }
+    int sendLen = myLen;
+    MPI_Bcast(&extTotal, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+    if (extTotal == 0) sendLen = 0;
+    MPI_Gatherv(extData, sendLen, MPI_CHAR, extAll, extLens, extDispls, MPI_CHAR, 0, MPI_COMM_WORLD);
+    if (proc == 0) {
+      const char **ptrs = (const char **)calloc(totalProcs, sizeof(char *));
+      size_t *lens = (size_t *)calloc(totalProcs, sizeof(size_t));
+      for (int p = 0; p < totalProcs; p++) { ptrs[p] = extAll + extDispls[p]; lens[p] = (size_t)extLens[p]; }
+      nccl_tests_ext_process_end_gathered(totalProcs, ptrs, lens);
+      free(ptrs); free(lens); free(extAll); free(extLens); free(extDispls);
+    }
+#else
+    nccl_tests_ext_process_end_gathered(1, &extData, &extLen);
+#endif
+  }
+#endif
 
 #ifdef MPI_SUPPORT
   MPI_Comm_free(&mpi_comm);
