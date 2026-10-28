@@ -15,7 +15,7 @@
 #define NCCL_TESTS_EXT_ENABLED 1
 // Only the main thread of the reporting process reports. run() sets is_main_thread.
 #define NCCL_TESTS_EXT(call)        do { if (is_main_thread) { call; } } while (0)
-// For hooks that run before is_main_thread is known, such as process init and writer identification.
+// For hooks that run on every process, such as init, the run id exchange and finalize.
 #define NCCL_TESTS_EXT_ALWAYS(call) do { call; } while (0)
 #else
 #define NCCL_TESTS_EXT_ENABLED 0
