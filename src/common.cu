@@ -1271,7 +1271,7 @@ testResult_t run() {
     if (p == proc) break;
     if (hostHashs[p] == hostHashs[proc]) localRank++;
   }
-#if NCCL_TESTS_EXT_ENABLED
+#ifdef NCCL_TESTS_EXTENSION
   // Rank 0 picks the run id and every process takes it, so per-node output joins the same run.
   {
     char extRunId[64] = {0};
@@ -1632,7 +1632,7 @@ testResult_t run() {
   }
   finalizeFooter();
 
-#if NCCL_TESTS_EXT_ENABLED
+#ifdef NCCL_TESTS_EXTENSION
   // Each process hands the extension's end-of-run text to rank 0, after the communicators
   // are gone and while MPI is still up.
   {
