@@ -31,7 +31,8 @@ endif
 # Optional build-time extension, described in ext_hooks.h.
 ifneq ($(EXT_DIR),)
 NVCUFLAGS += -DNCCL_TESTS_EXTENSION -I$(EXT_DIR)/include
-NVLDFLAGS += $(EXT_DIR)/build/libnccltestsext.a
+EXT_HDRS := $(EXT_DIR)/include/nccl_tests_ext.h
+EXT_LIBS := $(EXT_DIR)/build/libnccltestsext.a
 endif
 LIBRARIES += nccl
 NVLDFLAGS += $(LIBRARIES:%=-l%) -ldl
@@ -53,12 +54,12 @@ include ../verifiable/verifiable.mk
 
 .PRECIOUS: ${DST_DIR}/%.o
 
-${DST_DIR}/%.o: %.cu common.h util.h $(TEST_VERIFIABLE_HDRS)
+${DST_DIR}/%.o: %.cu common.h util.h ext_hooks.h $(EXT_HDRS) $(TEST_VERIFIABLE_HDRS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p ${DST_DIR}
 	$(NVCC) -o $@ $(NVCUFLAGS) -c $<
 
-${DST_DIR}/%$(NAME_SUFFIX).o: %.cu common.h util.h $(TEST_VERIFIABLE_HDRS)
+${DST_DIR}/%$(NAME_SUFFIX).o: %.cu common.h util.h ext_hooks.h $(EXT_HDRS) $(TEST_VERIFIABLE_HDRS)
 	@printf "Compiling  %-35s > %s\n" $< $@
 	@mkdir -p ${DST_DIR}
 	$(NVCC) -o $@ $(NVCUFLAGS) -c $<
@@ -69,12 +70,12 @@ ${DST_DIR}/timer.o: timer.cc timer.h
 	$(CXX) $(CXXFLAGS) -o $@ -c $<
 
 ifeq ($(DSO), 1)
-${DST_DIR}/%_perf$(NAME_SUFFIX): ${DST_DIR}/%.o ${DST_DIR}/common$(NAME_SUFFIX).o ${DST_DIR}/util$(NAME_SUFFIX).o ${DST_DIR}/timer.o $(TEST_VERIFIABLE_LIBS)
+${DST_DIR}/%_perf$(NAME_SUFFIX): ${DST_DIR}/%.o ${DST_DIR}/common$(NAME_SUFFIX).o ${DST_DIR}/util$(NAME_SUFFIX).o ${DST_DIR}/timer.o $(EXT_LIBS) $(TEST_VERIFIABLE_LIBS)
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p ${DST_DIR}
 	$(NVCC) -o $@ $(NVCUFLAGS) $^ -L$(TEST_VERIFIABLE_BUILDDIR) -lverifiable ${NVLDFLAGS} -Xlinker "--enable-new-dtags" -Xlinker "-rpath,\$$ORIGIN:\$$ORIGIN/verifiable"
 else
-${DST_DIR}/%_perf$(NAME_SUFFIX):${DST_DIR}/%.o ${DST_DIR}/common$(NAME_SUFFIX).o ${DST_DIR}/util$(NAME_SUFFIX).o ${DST_DIR}/timer.o $(TEST_VERIFIABLE_OBJS)
+${DST_DIR}/%_perf$(NAME_SUFFIX):${DST_DIR}/%.o ${DST_DIR}/common$(NAME_SUFFIX).o ${DST_DIR}/util$(NAME_SUFFIX).o ${DST_DIR}/timer.o $(EXT_LIBS) $(TEST_VERIFIABLE_OBJS)
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p ${DST_DIR}
 	$(NVCC) -o $@ $(NVCUFLAGS) $^ ${NVLDFLAGS}
