@@ -1,12 +1,15 @@
 /*************************************************************************
  * Build-time extension hooks.
  *
- * These macros let an extension linked in at build time observe a run. The
- * extension receives the run configuration, the result for each message
- * size, every device, the closing summary and any errors. Setting EXT_DIR in
- * the Makefile defines NCCL_TESTS_EXTENSION, which includes
- * <nccl_tests_ext.h> from EXT_DIR/include and enables the hooks. When
- * EXT_DIR is unset, the hooks compile to nothing and the tests behave
+ * These macros let an extension linked in at build time observe a run. At
+ * startup the extension receives the command line and the environment,
+ * filtered the same way as in the JSON report. During the run it receives
+ * the run configuration, the result for each message size, every device,
+ * the closing summary, and any errors. On rank 0 it picks a run ID for every
+ * process to share, and at the end it collects text from every process.
+ * Setting EXT_DIR in the Makefile defines NCCL_TESTS_EXTENSION, which
+ * includes <nccl_tests_ext.h> from EXT_DIR/include and enables the hooks.
+ * When EXT_DIR is unset, the hooks compile to nothing and the tests behave
  * exactly as they would without them.
  ************************************************************************/
 #ifndef __EXT_HOOKS_H__
