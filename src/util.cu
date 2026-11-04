@@ -685,52 +685,6 @@ static void jsonRankInfo(const rankInfo_t *ri) {
 #define NVML_DEVICE_VBIOS_VERSION_BUFFER_SIZE 32
 #endif
 #define EXT_FIELD_LEN 512
-// Per-GPU identity for the built-in extension only. The NVML serial is shared by the GPUs of
-// one module on some boards, so the extension also gets the device UUID. The UUIDs travel in
-// their own gathered buffer, one "device uuid" entry per local GPU, so the printed device
-// lines and the JSON stay identical to a stock build.
-//
-// NVML is already initialized by the NvmlSession in writeDeviceReport. The two symbols this
-// needs come from the driver library by name, so the extension does not depend on how the
-// rest of this file links or loads NVML.
-static int getGPUUuid(const char *pciBusId, char *uuid, size_t len) {
-    typedef nvmlReturn_t (*GetHandleByPciBusIdFn)(const char *, nvmlDevice_t *);
-    typedef nvmlReturn_t (*GetUuidFn)(nvmlDevice_t, char *, unsigned int);
-    void *lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
-    if (lib == nullptr) return 1;
-    GetHandleByPciBusIdFn getHandle = (GetHandleByPciBusIdFn)dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2");
-    GetUuidFn getUuid = (GetUuidFn)dlsym(lib, "nvmlDeviceGetUUID");
-    int rc = 1;
-    nvmlDevice_t device;
-    if (getHandle != nullptr && getUuid != nullptr
-        && getHandle(pciBusId, &device) == NVML_SUCCESS
-        && getUuid(device, uuid, (unsigned int)len) == NVML_SUCCESS
-        && uuid[0] != '\0') {
-        rc = 0;
-    }
-    dlclose(lib);
-    return rc;
-}
-
-// VBIOS version of the GPU at pciBusId, read through NVML by name like the UUID above.
-static int getGPUVbios(const char *pciBusId, char *vbios, size_t len) {
-    typedef nvmlReturn_t (*GetHandleByPciBusIdFn)(const char *, nvmlDevice_t *);
-    typedef nvmlReturn_t (*GetVbiosFn)(nvmlDevice_t, char *, unsigned int);
-    void *lib = dlopen("libnvidia-ml.so.1", RTLD_NOW);
-    if (lib == nullptr) return 1;
-    GetHandleByPciBusIdFn getHandle = (GetHandleByPciBusIdFn)dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2");
-    GetVbiosFn getVbios = (GetVbiosFn)dlsym(lib, "nvmlDeviceGetVbiosVersion");
-    int rc = 1;
-    nvmlDevice_t device;
-    if (getHandle != nullptr && getVbios != nullptr
-        && getHandle(pciBusId, &device) == NVML_SUCCESS
-        && getVbios(device, vbios, (unsigned int)len) == NVML_SUCCESS
-        && vbios[0] != '\0') {
-        rc = 0;
-    }
-    dlclose(lib);
-    return rc;
-}
 
 // NUMA node of the PCI device from sysfs, or -1 when the kernel does not report one.
 static int getPciNumaNode(const char *pciBusId) {
@@ -874,6 +828,14 @@ struct NvmlSession {
   GetHandleByPciBusIdFn getHandleByPciBusId = nullptr;
   GetSerialFn getSerial = nullptr;
   ErrorStringFn errorString = nullptr;
+#ifdef NCCL_TESTS_EXTENSION
+  // The extension reads each GPU's UUID and VBIOS version through these.
+  // The constructor treats them as optional, so GPU serials still work with
+  // a driver that lacks them.
+  typedef nvmlReturn_t (*GetStringFn)(nvmlDevice_t, char *, unsigned int);
+  GetStringFn getUuid = nullptr;
+  GetStringFn getVbiosVersion = nullptr;
+#endif
   bool ready = false;
 
   NvmlSession() {
@@ -884,6 +846,10 @@ struct NvmlSession {
     getHandleByPciBusId = (GetHandleByPciBusIdFn)dlsym(lib, "nvmlDeviceGetHandleByPciBusId_v2");
     getSerial = (GetSerialFn)dlsym(lib, "nvmlDeviceGetSerial");
     errorString = (ErrorStringFn)dlsym(lib, "nvmlErrorString");
+#ifdef NCCL_TESTS_EXTENSION
+    getUuid = (GetStringFn)dlsym(lib, "nvmlDeviceGetUUID");
+    getVbiosVersion = (GetStringFn)dlsym(lib, "nvmlDeviceGetVbiosVersion");
+#endif
     if (!init || !shutdown || !getHandleByPciBusId || !getSerial || !errorString) return;
     ready = (init() == NVML_SUCCESS);
   }
@@ -928,6 +894,25 @@ static int getGPUSerial(const NvmlSession &nvml, const char *pciBusId, char *ser
 
   return 0;
 }
+
+#ifdef NCCL_TESTS_EXTENSION
+// Per-GPU identity for the built-in extension only. The NVML serial is shared by the GPUs of
+// one module on some boards, so the extension also gets the device UUID. The UUIDs travel in
+// their own gathered buffer, one "device uuid" entry per local GPU, so the printed device
+// lines and the JSON stay identical to a stock build.
+//
+// Read one string property of the GPU at "pciBusId" into "out" through
+// "get", which is nvml.getUuid or nvml.getVbiosVersion. Returns nonzero
+// when "get" is unavailable, the lookup fails, or the string is empty.
+static int getGPUString(const NvmlSession &nvml, NvmlSession::GetStringFn get,
+                        const char *pciBusId, char *out, size_t len) {
+  nvmlDevice_t device;
+  if (get == nullptr) return 1;
+  if (nvml.getHandleByPciBusId(pciBusId, &device) != NVML_SUCCESS) return 1;
+  if (get(device, out, (unsigned int)len) != NVML_SUCCESS) return 1;
+  return out[0] == '\0';
+}
+#endif
 
 // Write a random RFC 4122 version 4 UUID into 'out' as 36 characters plus NUL.
 static void genUuidV4(char out[37]) {
@@ -1143,10 +1128,12 @@ testResult_t writeDeviceReport(size_t *maxMem, int localRank, int proc, int tota
     {
       char gpuUuid[NVML_DEVICE_UUID_V2_BUFFER_SIZE];
       char gpuVbios[NVML_DEVICE_VBIOS_VERSION_BUFFER_SIZE];
-      if (!nvml.ready || pciBusId[0] == '\0' || getGPUUuid(pciBusId, gpuUuid, sizeof(gpuUuid)) != 0) {
+      if (!nvml.ready || pciBusId[0] == '\0'
+          || getGPUString(nvml, nvml.getUuid, pciBusId, gpuUuid, sizeof(gpuUuid)) != 0) {
         snprintf(gpuUuid, sizeof(gpuUuid), "unknown");
       }
-      if (!nvml.ready || pciBusId[0] == '\0' || getGPUVbios(pciBusId, gpuVbios, sizeof(gpuVbios)) != 0) {
+      if (!nvml.ready || pciBusId[0] == '\0'
+          || getGPUString(nvml, nvml.getVbiosVersion, pciBusId, gpuVbios, sizeof(gpuVbios)) != 0) {
         snprintf(gpuVbios, sizeof(gpuVbios), "unknown");
       }
       for (char *c = gpuVbios; *c; c++) if (*c == ' ') *c = '_';
