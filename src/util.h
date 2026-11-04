@@ -25,6 +25,12 @@ struct memInfo_t {
 // The top-level object remains open for the rest of the output.
 void jsonOutputInit(const char *path, int argc, char **argv, char **envp);
 
+// Build a NULL-terminated array for reporting 'envp'. It omits and redacts
+// entries by the same rules as the env list in the JSON report. The caller
+// owns the array and frees it with free(), but must not free its entries.
+// Returns nullptr when allocation fails.
+char **reportableEnv(char **envp);
+
 // Should be called to identify main thread after threads are started to ensure we don't duplicate output
 void jsonIdentifyWriter(bool is_writer);
 

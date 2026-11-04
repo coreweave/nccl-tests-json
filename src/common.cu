@@ -1207,7 +1207,12 @@ int main(int argc, char* argv[], char **envp) {
 
   const output_file_type_t output_file_type = classifyOutputFile(output_file);
   outputFileInit(output_file_type, output_file, argc, argv, envp);
-  NCCL_TESTS_EXT_ALWAYS(nccl_tests_ext_init(argc, argv, envp));
+#ifdef NCCL_TESTS_EXTENSION
+  // The extension gets the same filtered environment as the JSON report.
+  char **extEnv = reportableEnv(envp);
+  static char *noEnv[] = { nullptr };
+  NCCL_TESTS_EXT_ALWAYS(nccl_tests_ext_init(argc, argv, extEnv ? extEnv : noEnv));
+#endif
 
   if(output_file) {
     free(output_file);
@@ -1219,6 +1224,11 @@ int main(int argc, char* argv[], char **envp) {
   outputFileFinalize(output_file_type);
   // Every process finalizes, so an extension can act on each node.
   NCCL_TESTS_EXT_ALWAYS(nccl_tests_ext_finalize((int)result));
+#ifdef NCCL_TESTS_EXTENSION
+  // Freed only after finalize, so the extension can hold on to the
+  // environment it received at init for the whole run.
+  free(extEnv);
+#endif
 
   TESTCHECK(result);
 

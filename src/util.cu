@@ -443,25 +443,52 @@ static bool envValueLooksSecret(const char *value) {
   return false;
 }
 
-// Write one KEY=VALUE environment entry to the open JSON list, omitting it
-// or redacting its value according to the tables above.
-static void jsonEnvEntry(const char *entry) {
+enum envVerdict_t { ENV_OMIT, ENV_KEEP, ENV_REDACT };
+
+// Decide whether to omit, keep, or redact one KEY=VALUE environment entry,
+// according to the tables above. When the answer is ENV_REDACT, this also
+// stores the length of KEY in 'nameLen', so the caller can write KEY back
+// out with the redacted value.
+static envVerdict_t classifyEnvEntry(const char *entry, size_t *nameLen) {
   const char *eq = strchr(entry, '=');
   const char *nameEnd = eq ? eq : entry + strlen(entry);
   if (!envNameStartsWith(entry, nameEnd, RELEVANT_ENV_NAME_PREFIXES)
-      && !envNameEquals(entry, nameEnd, RELEVANT_ENV_NAMES)) return;
-  if (envNameEquals(entry, nameEnd, DENIED_ENV_NAMES)) return;
+      && !envNameEquals(entry, nameEnd, RELEVANT_ENV_NAMES)) return ENV_OMIT;
+  if (envNameEquals(entry, nameEnd, DENIED_ENV_NAMES)) return ENV_OMIT;
   if (envNameContains(entry, nameEnd, SENSITIVE_ENV_NAME_PARTS)
-      && !envNameContains(entry, nameEnd, EXEMPT_ENV_NAME_PARTS)) return;
+      && !envNameContains(entry, nameEnd, EXEMPT_ENV_NAME_PARTS)) return ENV_OMIT;
   if (eq && envValueLooksSecret(eq + 1)) {
-    char *redacted = nullptr;
-    if (asprintf(&redacted, "%.*s=%s", (int)(eq - entry), entry, ENV_REDACTED_VALUE) != -1) {
-      jsonStr(redacted);
-      free(redacted);
-    }
-    return;
+    *nameLen = eq - entry;
+    return ENV_REDACT;
   }
-  jsonStr(entry);
+  return ENV_KEEP;
+}
+
+char **reportableEnv(char **envp) {
+  size_t kept = 0, redactedBytes = 0, nameLen;
+  for (char **e = envp; *e; e++) {
+    switch (classifyEnvEntry(*e, &nameLen)) {
+      case ENV_OMIT: break;
+      case ENV_KEEP: kept++; break;
+      case ENV_REDACT: kept++; redactedBytes += nameLen + 1 + sizeof(ENV_REDACTED_VALUE); break;
+    }
+  }
+  char **out = (char **)malloc((kept + 1) * sizeof(char *) + redactedBytes);
+  if (out == nullptr) return nullptr;
+  char *redacted = (char *)(out + kept + 1);
+  size_t i = 0;
+  for (char **e = envp; *e; e++) {
+    switch (classifyEnvEntry(*e, &nameLen)) {
+      case ENV_OMIT: break;
+      case ENV_KEEP: out[i++] = *e; break;
+      case ENV_REDACT:
+        out[i++] = redacted;
+        redacted += sprintf(redacted, "%.*s=%s", (int)nameLen, *e, ENV_REDACTED_VALUE) + 1;
+        break;
+    }
+  }
+  out[i] = nullptr;
+  return out;
 }
 
 // We provide some status line to stdout.
@@ -530,7 +557,19 @@ void jsonOutputInit(const char *in_path,
   jsonKey("env");
   jsonStartList();
   for(char **e = envp; *e; e++) {
-    jsonEnvEntry(*e);
+    size_t nameLen;
+    switch (classifyEnvEntry(*e, &nameLen)) {
+      case ENV_OMIT: break;
+      case ENV_KEEP: jsonStr(*e); break;
+      case ENV_REDACT: {
+        char *redacted = nullptr;
+        if (asprintf(&redacted, "%.*s=%s", (int)nameLen, *e, ENV_REDACTED_VALUE) != -1) {
+          jsonStr(redacted);
+          free(redacted);
+        }
+        break;
+      }
+    }
   }
   jsonFinishList();
   jsonKey("nccl_version"); jsonInt(test_ncclVersion);
